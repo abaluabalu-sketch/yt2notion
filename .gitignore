@@ -1,6 +1,14 @@
-# Secrets
+# ══════════════════════════════════════════════════════════════
+# SECRETS — NEVER commit these
+# ══════════════════════════════════════════════════════════════
 .env
+.env.*
+!.env.example
 cookies.txt
+*.key
+*.pem
+*.p12
+credentials*.json
 
 # Python
 __pycache__/
@@ -19,3 +27,10 @@ Thumbs.db
 
 # Temp
 /tmp/
+
+# Audio/video files (large, don't belong in git)
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.webm

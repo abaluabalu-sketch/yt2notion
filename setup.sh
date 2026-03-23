@@ -141,7 +141,20 @@ else
 fi
 echo ""
 
-# ── 6. Check .env ────────────────────────────────────────
+# ── 6. Install pre-commit hook (secret leak prevention) ──
+echo "🔒 [6/6] Installing pre-commit hook..."
+HOOK_SRC="$SCRIPT_DIR/.githooks/pre-commit"
+HOOK_DST="$SCRIPT_DIR/.git/hooks/pre-commit"
+if [ -f "$HOOK_SRC" ] && [ -d "$SCRIPT_DIR/.git/hooks" ]; then
+    cp "$HOOK_SRC" "$HOOK_DST"
+    chmod +x "$HOOK_DST"
+    echo "✅ Pre-commit hook installed (blocks accidental secret commits)"
+else
+    echo "⚠️  Could not install pre-commit hook (not a git repo?)"
+fi
+echo ""
+
+# ── 7. Check .env ────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     echo "⚠️  No .env file found!"
