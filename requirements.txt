@@ -1,0 +1,7 @@
+anthropic
+openai
+notion-client
+youtube-transcript-api
+yt-dlp
+python-dotenv
+imageio-ffmpeg

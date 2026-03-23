@@ -1,19 +1,22 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## IMPORTANT: YouTube → Notion Command
+
+**When the user pastes a YouTube URL (youtube.com, youtu.be) and mentions Notion, saving, summarizing, or transcribing — IMMEDIATELY run the command below. Do NOT search the web, do NOT try to fetch the video yourself, do NOT use MCP tools. Just run this bash command:**
+
+```bash
+cd /Users/Abalu/Claude-0316 && echo "YOUTUBE_URL_HERE" | python yt2notion.py
+```
+
+Replace `YOUTUBE_URL_HERE` with the actual URL from the user's message. Set a timeout of 600000ms (10 minutes) since long videos take time to process. Report the Notion page URL when done.
+
+**Trigger phrases:** "save to Notion", "summarize this video", "transcribe to Notion", "yt2notion", or any YouTube URL + Notion intent.
+
+---
 
 ## What This Is
 
 A single-file Python CLI tool (`yt2notion.py`) that takes a YouTube URL and creates a structured Notion page containing a summary with clickable timestamps and a formatted full transcript.
-
-## Running the Script
-
-```bash
-pip install -r requirements.txt
-python yt2notion.py
-```
-
-The script prompts interactively for a YouTube URL — there are no CLI arguments.
 
 ## Required Configuration (`.env`)
 
@@ -38,13 +41,15 @@ The pipeline runs in 6 sequential steps:
 5. **Format conversation** — GPT-4o-mini reformats transcript with inferred speaker labels
 6. **Create Notion page** — batched API calls (max 100 blocks per request)
 
-### Transcript 3-Tier Strategy
+### Transcript Strategy (2-tier, NO auto-generated subtitles)
+
+**Auto-generated subtitles are NEVER used.** Only manually uploaded subtitles or local Whisper.
 
 | Tier | Method | Fallback trigger |
 |---|---|---|
-| 1 | `youtube_transcript_api` (prefers manual over auto-generated) | Any exception |
-| 2 | `yt-dlp --write-sub` with Chrome cookies (handles members-only) | No `.vtt` files found |
-| 3 | `whisper.cpp large-v3` (local, Metal GPU, ~5× realtime) | Always available as last resort |
+| 1 | `youtube_transcript_api` — manual subtitles ONLY (`is_generated=False`) | No manual subtitles found, or any exception |
+| 2 | `yt-dlp --write-sub` — manual subtitles only (no `--write-auto-sub`) with Chrome cookies | No `.vtt` files found (excludes `.auto.vtt`) |
+| 3 | `whisper.cpp large-v3` + `ggml-small.en-tdrz` (speaker diarization) | Always runs when no manual subtitles exist |
 
 ### External System Paths
 

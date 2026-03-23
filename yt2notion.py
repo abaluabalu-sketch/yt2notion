@@ -1,19 +1,38 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """
 yt2notion.py — YouTube → Notion summarizer
 
 Usage: python yt2notion.py
 Prompts for a YouTube URL, then:
-  1. Fetches metadata (title, thumbnail)
-  2. Gets transcript (YouTube captions or Whisper fallback)
-  3. Summarizes key topics with timestamps via Claude
-  4. Creates a Notion page with the results
+  1. Fetches metadata (title, thumbnail, language) via yt-dlp
+  2. Gets transcript via 3-tier strategy:
+     a. youtube_transcript_api — prefers manual subtitles over auto-generated
+     b. yt-dlp --write-sub — with Chrome cookies for members-only videos
+     c. whisper.cpp large-v3 — local transcription with Metal GPU acceleration
+  3. Summarizes 5-10 key topics with timestamps via GPT-4o-mini
+     - Summary language matches the dominant language of the transcript
+  4. Reformats transcript as a conversation via GPT-4o-mini
+     - Speaker labels: real names > inferred roles > Person 1/2 > no labels
+  5. Creates a structured Notion page with:
+     - YouTube bookmark + thumbnail
+     - Summary with clickable timestamp links (youtube.com?v=ID&t=Xs)
+     - Full transcript as readable conversation
+
+Dependencies:
+  pip: openai, notion-client, python-dotenv, yt-dlp, youtube-transcript-api, imageio-ffmpeg
+  system: whisper.cpp (compiled with Metal), Node.js (for yt-dlp JS challenges)
+
+Config (.env):
+  OPENAI_API_KEY=sk-proj-...
+  NOTION_API_KEY=secret_...
+  NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 """
 
 import os
 import re
 import sys
 import json
+import time
 import tempfile
 import subprocess
 import textwrap
@@ -48,13 +67,19 @@ def _yt_dlp_extra_args() -> list[str]:
     return args
 
 
-# ── API clients (lazy init) ────────────────────────────────────────────────
-def get_openai():
-    from openai import OpenAI
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        sys.exit("Error: OPENAI_API_KEY not set in .env")
-    return OpenAI(api_key=key)
+# ── Claude CLI (no API key needed — uses Claude Code session) ─────────────
+CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
+
+def call_claude(prompt: str, max_tokens: int = 8192) -> str:
+    """Call the claude CLI with a prompt, return the response text."""
+    result = subprocess.run(
+        [str(CLAUDE_BIN), "--print", "--output-format", "text"],
+        input=prompt,
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        sys.exit(f"Error calling claude CLI: {result.stderr}")
+    return result.stdout.strip()
 
 
 def get_notion():
@@ -112,32 +137,35 @@ def format_timestamp(seconds: float) -> str:
 
 
 def get_youtube_transcript(video_id: str, url: str) -> list[dict] | None:
-    """Try to fetch existing YouTube captions. Returns list of {text, start} or None.
+    """Try to fetch manually uploaded YouTube subtitles only.
+
+    Auto-generated subtitles are NEVER used — Whisper produces better quality.
 
     Strategy:
-      1. youtube_transcript_api — fast, prefers manual subtitles over auto-generated
-      2. yt-dlp --write-sub     — uses Chrome cookies, works for members-only videos
+      1. youtube_transcript_api — manual subtitles only (is_generated=False)
+      2. yt-dlp --write-sub     — manual subtitles only, with Chrome cookies
+    Returns None if no manual subtitles found → caller falls back to Whisper.
     """
     # ── Method 1: youtube_transcript_api ──────────────────────────────────
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
-        print("  Trying YouTube transcript API...")
+        print("  Trying YouTube transcript API (manual subtitles only)...")
         api = YouTubeTranscriptApi()
         transcript_list = api.list(video_id)
 
-        # Prefer manually created subtitles over auto-generated
+        # Manual subtitles ONLY — skip auto-generated entirely
         manual = [t for t in transcript_list if not t.is_generated]
-        auto   = [t for t in transcript_list if t.is_generated]
-        candidates = manual + auto  # manual first
 
-        if candidates:
-            chosen = candidates[0]
-            print(f"  Found {'manual' if not chosen.is_generated else 'auto-generated'} "
-                  f"subtitles in {chosen.language!r} ({chosen.language_code})")
+        if manual:
+            chosen = manual[0]
+            print(f"  Found manual subtitles in {chosen.language!r} ({chosen.language_code})")
             data = chosen.fetch()
             segments = [{"text": s.text.strip(), "start": s.start} for s in data]
             print(f"  {len(segments)} segments fetched")
             return segments
+        else:
+            print("  No manual subtitles found, will use Whisper")
+            return None
 
     except Exception as e:
         print(f"  youtube_transcript_api failed ({type(e).__name__}), trying yt-dlp subtitles...")
@@ -152,8 +180,8 @@ def get_youtube_transcript(video_id: str, url: str) -> list[dict] | None:
                     "yt-dlp",
                     "--no-playlist",
                     "--skip-download",
-                    "--write-sub",        # manually uploaded subtitles
-                    "--write-auto-sub",   # auto-generated as fallback
+                    "--write-sub",        # manually uploaded subtitles ONLY
+                    # NOTE: --write-auto-sub intentionally omitted
                     "--sub-langs", "all",
                     "--sub-format", "vtt",
                     "--ffmpeg-location", FFMPEG_PATH,
@@ -169,13 +197,15 @@ def get_youtube_transcript(video_id: str, url: str) -> list[dict] | None:
                 print("  No subtitle files found via yt-dlp")
                 return None
 
-            # Prefer manually uploaded subs (yt-dlp names them differently from .auto.)
+            # Only use manually uploaded subs — exclude any .auto. files
             manual_vtt = [f for f in vtt_files if ".auto." not in f]
-            chosen_vtt = (manual_vtt or vtt_files)[0]
+            if not manual_vtt:
+                print("  Only auto-generated subtitles found via yt-dlp, will use Whisper")
+                return None
+
+            chosen_vtt = manual_vtt[0]
             lang_tag = Path(chosen_vtt).stem.split(".")[-1]
-            is_auto = ".auto." in chosen_vtt
-            print(f"  Found {'auto-generated' if is_auto else 'manual'} subtitles "
-                  f"via yt-dlp (lang: {lang_tag})")
+            print(f"  Found manual subtitles via yt-dlp (lang: {lang_tag})")
 
             segments = _parse_vtt(chosen_vtt)
             print(f"  {len(segments)} segments parsed from subtitle file")
@@ -246,43 +276,129 @@ def _download_audio(url: str, tmpdir: str) -> Path:
     return audio_path
 
 
+# ── whisper.cpp paths ─────────────────────────────────────────────────────
+WHISPER_CPP_BIN   = Path.home() / ".local" / "whisper-cpp" / "whisper-cli"
+WHISPER_CPP_MODEL = Path.home() / ".local" / "whisper-cpp" / "models" / "ggml-large-v3-turbo.bin"
+
+def _parse_whisper_json(json_path: Path) -> list[dict]:
+    """Parse whisper.cpp JSON output into {text, start} segments.
+
+    Also strips trailing hallucination loops — whisper.cpp sometimes repeats
+    the same phrase dozens of times at the end of audio (silence/music).
+    """
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    segments = []
+    for item in data.get("transcription", []):
+        text = item.get("text", "").strip()
+        ts_from = item.get("timestamps", {}).get("from", "00:00:00.000")
+        ts_to = item.get("timestamps", {}).get("to", ts_from)
+        parts_from = ts_from.replace(",", ".").split(":")
+        parts_to = ts_to.replace(",", ".").split(":")
+        start = float(parts_from[0]) * 3600 + float(parts_from[1]) * 60 + float(parts_from[2])
+        end = float(parts_to[0]) * 3600 + float(parts_to[1]) * 60 + float(parts_to[2])
+        if text:
+            segments.append({"text": text, "start": start, "end": end})
+
+    # ── Remove trailing hallucination loops ──────────────────────────────
+    # If the last N segments are all the same text, it's a whisper hallucination.
+    # Walk backwards and strip repeated trailing phrases.
+    if len(segments) > 5:
+        segments = _strip_trailing_hallucinations(segments)
+
+    return segments
+
+
+def _strip_trailing_hallucinations(segments: list[dict]) -> list[dict]:
+    """Remove repeated segments from the tail of whisper output.
+
+    Detects when the same phrase (or very similar) repeats 3+ times
+    at the end — a common whisper.cpp artifact on silence/music.
+    Also removes interior runs of 3+ identical consecutive segments.
+    """
+    # Normalize text for comparison
+    def norm(t: str) -> str:
+        return re.sub(r'\s+', ' ', t.strip().lower())
+
+    # 1. Strip trailing repetitions
+    if len(segments) >= 3:
+        tail_text = norm(segments[-1]["text"])
+        # Count how many trailing segments match the last one
+        repeat_count = 0
+        for seg in reversed(segments):
+            if norm(seg["text"]) == tail_text:
+                repeat_count += 1
+            else:
+                break
+        if repeat_count >= 3:
+            print(f"  Stripped {repeat_count} trailing hallucinated segments "
+                  f"(\"{segments[-1]['text'][:60]}...\")")
+            segments = segments[:-repeat_count]
+
+    # 2. Remove interior runs of 3+ identical consecutive segments
+    cleaned = []
+    run_count = 1
+    for i, seg in enumerate(segments):
+        if i > 0 and norm(seg["text"]) == norm(segments[i - 1]["text"]):
+            run_count += 1
+        else:
+            run_count = 1
+        if run_count <= 2:  # keep at most 2 consecutive identical segments
+            cleaned.append(seg)
+
+    if len(cleaned) < len(segments):
+        print(f"  Removed {len(segments) - len(cleaned)} duplicate interior segments")
+
+    return cleaned
+
+
+
+
 def transcribe_with_whisper_local(url: str) -> list[dict]:
-    """Download audio and transcribe with local Whisper model (fallback)."""
-    print("  Downloading audio for local Whisper transcription...")
+    """Download audio and transcribe with whisper.cpp (Metal GPU accelerated)."""
+    if not WHISPER_CPP_BIN.exists():
+        sys.exit(f"Error: whisper.cpp not found at {WHISPER_CPP_BIN}")
+    if not WHISPER_CPP_MODEL.exists():
+        sys.exit(f"Error: Whisper model not found at {WHISPER_CPP_MODEL}")
+
+    print("  Downloading audio for whisper.cpp transcription...")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         audio_path = _download_audio(url, tmpdir)
 
-        # Convert to raw PCM f32le via our bundled ffmpeg, then load as numpy array.
-        # This bypasses whisper's load_audio() which requires ffmpeg in PATH.
-        print("  Converting audio to PCM with bundled ffmpeg...")
-        import numpy as np
-        pcm_result = subprocess.run(
+        # Convert to 16kHz mono WAV (required by whisper.cpp)
+        wav_path = Path(tmpdir) / "audio.wav"
+        print("  Converting audio to 16kHz WAV...")
+        subprocess.run(
             [FFMPEG_PATH, "-i", str(audio_path),
-             "-ar", "16000", "-ac", "1", "-f", "f32le", "-"],
+             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav_path)],
             capture_output=True, check=True
         )
-        audio_np = np.frombuffer(pcm_result.stdout, np.float32).copy()
 
-        print("  Transcribing with local Whisper model (this may take a few minutes)...")
-        try:
-            import whisper
-        except ImportError:
-            sys.exit("Error: 'whisper' package not installed. Run: pip install openai-whisper")
+        # ── Transcription: whisper.cpp large-v3 ─────────────────────────────
+        print("  Transcribing with large-v3-turbo (Metal GPU)...")
+        r1 = subprocess.run(
+            [str(WHISPER_CPP_BIN),
+             "-m", str(WHISPER_CPP_MODEL),
+             "-f", str(wav_path),
+             "-l", "auto",
+             "--output-json",
+             "-of", str(Path(tmpdir) / "main_out")],
+            capture_output=True, text=True
+        )
+        if r1.returncode != 0:
+            sys.exit(f"Error: whisper.cpp failed:\n{r1.stderr}")
 
-        model = whisper.load_model("large-v3")
-        result = model.transcribe(audio_np, verbose=False, fp16=False)
+        json_path = Path(tmpdir) / "main_out.json"
+        if not json_path.exists():
+            sys.exit(f"Error: whisper.cpp produced no JSON.\nstderr: {r1.stderr}")
+        segments = _parse_whisper_json(json_path)
 
-    segments = [
-        {"text": seg["text"].strip(), "start": seg["start"]}
-        for seg in result["segments"]
-    ]
-    print(f"  Whisper returned {len(segments)} segments")
+    print(f"  whisper.cpp returned {len(segments)} segments")
     return segments
 
 
 def segments_to_text(segments: list[dict]) -> str:
-    """Convert transcript segments to a timestamped plain-text string for Claude."""
+    """Convert transcript segments to timestamped text for Claude."""
     lines = []
     for seg in segments:
         ts = format_timestamp(seg["start"])
@@ -293,15 +409,15 @@ def segments_to_text(segments: list[dict]) -> str:
 # ── Summarization ──────────────────────────────────────────────────────────
 
 def summarize(timestamped_text: str) -> str:
-    """Use OpenAI GPT to extract key topics with timestamps."""
-    print("  Summarizing with GPT-4o-mini...")
-    client = get_openai()
+    """Use Claude CLI to extract key topics with timestamps."""
+    print("  Summarizing with Claude...")
     prompt = (
         "You are summarizing a video transcript for a Notion page.\n"
         "The transcript below has timestamps in [MM:SS] format at the start of each segment.\n\n"
-        "IMPORTANT: Detect the dominant language of the transcript and write your entire "
-        "summary in that same language. For example, if the transcript is mostly Chinese, "
-        "write the summary in Chinese. If mostly English, write in English.\n\n"
+        "IMPORTANT: Always write the summary in Traditional Chinese (繁體中文). "
+        "Keep technical terms, brand names, product names, and proper nouns in their "
+        "original language (e.g. Claude Code, Anthropic, API, Bash, GitHub, MCP, SDK). "
+        "Everything else should be in natural, fluent Traditional Chinese.\n\n"
         "Identify 5 to 10 key topics covered in the video. For each topic:\n"
         "- Use the timestamp of when it starts\n"
         "- Write a concise 1–2 sentence description\n\n"
@@ -310,45 +426,146 @@ def summarize(timestamped_text: str) -> str:
         "Return ONLY the bulleted list. No preamble, no conclusion.\n\n"
         "TRANSCRIPT:\n" + timestamped_text
     )
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
+    return call_claude(prompt, max_tokens=1024)
+
+
+def _call_claude_async(prompt: str) -> subprocess.Popen:
+    """Launch a Claude CLI call as a non-blocking subprocess."""
+    return subprocess.Popen(
+        [str(CLAUDE_BIN), "--print", "--output-format", "text"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
     )
-    return response.choices[0].message.content.strip()
 
 
-def format_conversation(timestamped_text: str) -> str:
-    """Use OpenAI GPT to reformat transcript as a conversation with speaker labels."""
-    print("  Formatting transcript as conversation...")
-    client = get_openai()
+def _format_chunk(chunk_text: str, speaker_context: str, chunk_idx: int) -> str:
+    """Send one chunk to Claude CLI for formatting + cleaning. Blocking call."""
     prompt = (
-        "You are reformatting a video transcript into a clean, readable conversation.\n\n"
-        "Speaker labeling rules (in priority order):\n"
-        "1. Use real names if they are clearly mentioned in the transcript.\n"
-        "2. If names are unclear, infer roles from context:\n"
-        "   - Interview or podcast → 'Host' and 'Guest'\n"
-        "   - Q&A format → 'Interviewer' and 'Guest'\n"
-        "   - Two hosts → 'Host 1' and 'Host 2'\n"
-        "   - Lecture or course → 'Instructor'\n"
-        "   - Documentary narration → 'Narrator'\n"
-        "3. Only use 'Person 1' / 'Person 2' as a last resort if no role can be inferred.\n"
-        "4. If there is only one speaker, output clean paragraphs with NO labels at all.\n\n"
-        "Formatting rules:\n"
-        "- Remove all timestamps.\n"
-        "- Merge consecutive lines from the same speaker into one paragraph.\n"
-        "- Keep ALL content — do NOT summarize, skip, or shorten anything.\n"
-        "- Format: one speaker turn per line, like:\n"
-        "  Name or Role: What they said...\n\n"
-        "Return ONLY the reformatted transcript. No preamble, no explanation.\n\n"
-        "TRANSCRIPT:\n" + timestamped_text
+        "You are a professional transcript editor. Format this raw transcript chunk "
+        "as a clean, readable conversation.\n\n"
+        f"{speaker_context}"
+        "FORMATTING RULES:\n"
+        "1. Label each speaker turn with their name followed by colon\n"
+        "2. Merge consecutive sentences from the same speaker into one paragraph\n"
+        "3. Use blank lines between speaker turns\n"
+        "4. Continue from where the previous chunk left off — the last speaker "
+        "may still be talking\n\n"
+        "CLEANING RULES (apply these for readability):\n"
+        "- Remove filler words: \"um\", \"uh\", \"like\" (unless characterizing)\n"
+        "- Collapse false starts: \"I— I think—\" → \"I think\"\n"
+        "- Remove repeated words: \"it's it's really\" → \"it's really\"\n"
+        "- Use em-dash (—) for mid-sentence interruptions\n"
+        "- Mark unclear audio as [inaudible]\n"
+        "- Mark overlapping speech as [crosstalk]\n"
+        "- Fix obvious grammar from speech-to-text errors\n"
+        "- Keep technical terms, proper nouns, and numbers accurate\n\n"
+        "OUTPUT FORMAT:\n"
+        "Speaker Name: Their cleaned words here in one paragraph.\n\n"
+        "Another Speaker: Their response here.\n\n"
+        "Output ONLY the formatted conversation. No preamble, no commentary.\n\n"
+        "TRANSCRIPT CHUNK:\n" + chunk_text
     )
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        max_tokens=16384,
-        messages=[{"role": "user", "content": prompt}],
+    result = subprocess.run(
+        [str(CLAUDE_BIN), "--print", "--output-format", "text"],
+        input=prompt, capture_output=True, text=True
     )
-    return response.choices[0].message.content.strip()
+    if result.returncode != 0:
+        return chunk_text  # fallback to raw text
+    return result.stdout.strip()
+
+
+def format_conversation(segments: list[dict]) -> str:
+    """Detect speakers, clean transcript, and format as conversation.
+
+    Three-phase approach:
+      Phase 1: Identify speakers from a sample (~15s)
+      Phase 2: Split transcript into ~10K char chunks
+      Phase 3: Format chunks in parallel via concurrent Claude CLI calls (~30-60s)
+    """
+    print("  Detecting speakers & formatting conversation (Claude)...")
+    raw_text = " ".join(seg["text"] for seg in segments)
+
+    # ── Phase 1: Identify speakers from sample ───────────────────────────
+    sample_size = min(8000, len(raw_text))
+    sample = raw_text[:sample_size]
+
+    analysis_prompt = (
+        "You are analyzing a video transcript to identify speakers.\n\n"
+        "ANALYZE this transcript sample and return a JSON object with:\n"
+        "1. \"speakers\": list of speaker objects, each with:\n"
+        "   - \"name\": real name if mentioned, otherwise Host/Guest 1/Guest 2\n"
+        "   - \"role\": brief description (e.g. \"interviewer\", \"Anthropic engineer\")\n"
+        "   - \"style\": speaking pattern hints (e.g. \"asks questions\", \"technical details\")\n"
+        "2. \"speaker_count\": number of distinct speakers\n\n"
+        "Return ONLY valid JSON. No markdown fences, no commentary.\n\n"
+        "TRANSCRIPT SAMPLE:\n" + sample
+    )
+
+    speaker_context = ""
+    try:
+        analysis = call_claude(analysis_prompt, max_tokens=1024)
+        analysis = analysis.strip()
+        if analysis.startswith("```"):
+            analysis = re.sub(r"^```\w*\n?", "", analysis)
+            analysis = re.sub(r"\n?```$", "", analysis)
+        speaker_info = json.loads(analysis)
+        speakers = speaker_info.get("speakers", [])
+        if speakers:
+            names = [s.get("name", "Unknown") for s in speakers]
+            print(f"  Identified {len(speakers)} speakers: {', '.join(names)}")
+            speaker_context = "IDENTIFIED SPEAKERS:\n"
+            for s in speakers:
+                speaker_context += (
+                    f"- {s.get('name', '?')}: {s.get('role', '')} "
+                    f"({s.get('style', '')})\n"
+                )
+            speaker_context += "\n"
+    except Exception as e:
+        print(f"  Speaker analysis failed ({e}), continuing without speaker hints")
+
+    # ── Phase 2: Split into chunks (~10K chars each) ─────────────────────
+    chunk_size = 10000
+    chunks = []
+    for i in range(0, len(raw_text), chunk_size):
+        end = min(i + chunk_size, len(raw_text))
+        # Try to break at a sentence boundary
+        if end < len(raw_text):
+            last_period = raw_text.rfind(". ", i + chunk_size - 500, end)
+            if last_period > i:
+                end = last_period + 2
+        chunks.append(raw_text[i:end])
+
+    print(f"  Split into {len(chunks)} chunks, formatting in parallel...")
+
+    # ── Phase 3: Format chunks in parallel ───────────────────────────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def format_one(args):
+        idx, chunk = args
+        return idx, _format_chunk(chunk, speaker_context, idx)
+
+    results = [None] * len(chunks)
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
+        futures = {pool.submit(format_one, (i, c)): i for i, c in enumerate(chunks)}
+        for future in as_completed(futures):
+            idx, formatted = future.result()
+            results[idx] = formatted
+            print(f"  Chunk {idx + 1}/{len(chunks)} done")
+
+    # Merge results
+    merged = "\n\n".join(r for r in results if r)
+
+    # Count speakers in output
+    speakers = set()
+    for line in merged.split("\n"):
+        if ":" in line and not line.startswith(" "):
+            speaker = line.split(":")[0].strip()
+            if speaker and len(speaker) < 40 and not any(c.isdigit() for c in speaker):
+                speakers.add(speaker)
+    if speakers:
+        print(f"  Formatted with {len(speakers)} speakers: {', '.join(sorted(speakers))}")
+
+    return merged
 
 
 # ── Notion helpers ─────────────────────────────────────────────────────────
@@ -519,7 +736,10 @@ def create_notion_page(
         properties={
             "title": {
                 "title": [{"type": "text", "text": {"content": title}}]
-            }
+            },
+            "URL": {
+                "url": youtube_url
+            },
         },
         children=blocks[:100],
     )
@@ -552,30 +772,44 @@ def main():
     if not url.startswith("http"):
         url = "https://" + url
 
-    print("\n[1/6] Extracting video ID...")
+    total_start = time.time()
+    timings = {}
+
+    t0 = time.time()
+    print("\n[1/5] Extracting video ID...")
     video_id = extract_video_id(url)
     print(f"  Video ID: {video_id}")
+    timings["1. Extract ID"] = time.time() - t0
 
-    print("\n[2/6] Fetching metadata...")
+    t0 = time.time()
+    print("\n[2/5] Fetching metadata...")
     meta = fetch_metadata(url)
     print(f"  Title: {meta['title']}")
+    timings["2. Metadata"] = time.time() - t0
 
-    print("\n[3/6] Getting transcript...")
+    t0 = time.time()
+    print("\n[3/5] Getting transcript...")
     segments = get_youtube_transcript(video_id, url)
     if segments is None:
         segments = transcribe_with_whisper_local(url)
+    timings["3. Transcript"] = time.time() - t0
 
-    print("\n[4/6] Generating summary...")
+    t0 = time.time()
+    print("\n[4/5] Generating summary...")
     timestamped_text = segments_to_text(segments)
     summary = summarize(timestamped_text)
     print("\n  Key topics:")
     for line in summary.splitlines():
         print(f"    {line}")
+    timings["4. Summary (Claude)"] = time.time() - t0
 
-    print("\n[5/6] Formatting transcript as conversation...")
-    conversation_text = format_conversation(timestamped_text)
+    t0 = time.time()
+    # Detect speakers and format as conversation via Claude
+    conversation_text = format_conversation(segments)
+    timings["4b. Conversation (Claude)"] = time.time() - t0
 
-    print("\n[6/6] Creating Notion page...")
+    t0 = time.time()
+    print("\n[5/5] Creating Notion page...")
     page_url = create_notion_page(
         title=meta["title"],
         youtube_url=url,
@@ -584,10 +818,17 @@ def main():
         conversation_text=conversation_text,
         video_id=video_id,
     )
+    timings["5. Notion upload"] = time.time() - t0
 
+    total = time.time() - total_start
     print("\n" + "=" * 40)
     print("Done!")
     print(f"Notion page: {page_url}")
+    print(f"\n⏱  Timing breakdown:")
+    for step, secs in timings.items():
+        print(f"  {step}: {secs:.1f}s")
+    print(f"  {'─' * 30}")
+    print(f"  TOTAL: {total:.1f}s ({total/60:.1f} min)")
 
 
 if __name__ == "__main__":
