@@ -13,12 +13,15 @@ import re
 import subprocess
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
+load_dotenv()
+
 # ── Config ────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8056541322:AAH5d0FMR5KXCJPOw1w8m2GD3m-8EnZEm1U"
-ALLOWED_USER_ID = 8544301559
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ALLOWED_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 SCRIPT_DIR = Path(__file__).parent
 PYTHON_BIN = "/opt/anaconda3/bin/python3"
 
