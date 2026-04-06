@@ -71,15 +71,37 @@ def _yt_dlp_extra_args() -> list[str]:
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
 
 def call_claude(prompt: str, max_tokens: int = 8192) -> str:
-    """Call the claude CLI with a prompt, return the response text."""
+    """Call the claude CLI with a prompt, return the response text.
+
+    Falls back to OpenAI API (gpt-4o-mini) if the Claude CLI is unavailable
+    (e.g. when running inside a Claude Code session — 'Auto mode temporarily unavailable').
+    """
+    # Try Claude CLI first
     result = subprocess.run(
         [str(CLAUDE_BIN), "--print", "--output-format", "text"],
         input=prompt,
         capture_output=True, text=True
     )
-    if result.returncode != 0:
-        sys.exit(f"Error calling claude CLI: {result.stderr}")
-    return result.stdout.strip()
+    if result.returncode == 0:
+        output = result.stdout.strip()
+        if output and "auto mode temporarily unavailable" not in output.lower():
+            return output
+
+    # Fall back to OpenAI API
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        sys.exit("Error: Claude CLI unavailable and OPENAI_API_KEY not set in .env")
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        sys.exit(f"Error calling OpenAI API fallback: {e}")
 
 
 def get_notion():
@@ -92,7 +114,14 @@ def get_notion():
 
 # ── YouTube helpers ────────────────────────────────────────────────────────
 
-def extract_video_id(url: str) -> str:
+def detect_platform(url: str) -> str:
+    """Return 'vimeo' or 'youtube' (default) based on URL domain."""
+    if re.search(r"vimeo\.com", url, re.IGNORECASE):
+        return "vimeo"
+    return "youtube"
+
+
+def extract_youtube_id(url: str) -> str:
     """Extract YouTube video ID from various URL formats."""
     patterns = [
         r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})",
@@ -101,7 +130,22 @@ def extract_video_id(url: str) -> str:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
-    sys.exit(f"Error: Could not extract video ID from URL: {url}")
+    sys.exit(f"Error: Could not extract YouTube video ID from URL: {url}")
+
+
+def extract_vimeo_id(url: str) -> str:
+    """Extract Vimeo video ID from URL formats like vimeo.com/123456789."""
+    match = re.search(r"vimeo\.com/(\d+)", url)
+    if match:
+        return match.group(1)
+    sys.exit(f"Error: Could not extract Vimeo video ID from URL: {url}")
+
+
+def extract_video_id(url: str, platform: str = "youtube") -> str:
+    """Dispatch to platform-specific video ID extractor."""
+    if platform == "vimeo":
+        return extract_vimeo_id(url)
+    return extract_youtube_id(url)
 
 
 def fetch_metadata(url: str) -> dict:
@@ -215,6 +259,47 @@ def get_youtube_transcript(video_id: str, url: str) -> list[dict] | None:
         print(f"  yt-dlp subtitle download failed ({type(e).__name__}): {e}")
 
     return None
+
+
+def get_vimeo_transcript(url: str) -> list[dict] | None:
+    """Try to fetch subtitles for a Vimeo video via yt-dlp (Tier 2 only).
+
+    Vimeo has no transcript API equivalent to YouTubeTranscriptApi, so we
+    go straight to yt-dlp --write-sub. Returns None → caller falls back to Whisper.
+    """
+    import glob as _glob
+    print("  Trying yt-dlp subtitles for Vimeo...")
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_template = str(Path(tmpdir) / "sub")
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "--no-playlist",
+                    "--skip-download",
+                    "--write-sub",
+                    "--sub-langs", "all",
+                    "--sub-format", "vtt",
+                    "--ffmpeg-location", FFMPEG_PATH,
+                    *_yt_dlp_extra_args(),
+                    "-o", out_template,
+                    url,
+                ],
+                capture_output=True, text=True
+            )
+            vtt_files = _glob.glob(str(Path(tmpdir) / "*.vtt"))
+            if not vtt_files:
+                print("  No Vimeo subtitle files found, will use Whisper")
+                return None
+            chosen_vtt = vtt_files[0]
+            lang_tag = Path(chosen_vtt).stem.split(".")[-1]
+            print(f"  Found Vimeo subtitles via yt-dlp (lang: {lang_tag})")
+            segments = _parse_vtt(chosen_vtt)
+            print(f"  {len(segments)} segments parsed from Vimeo subtitle file")
+            return segments
+    except Exception as e:
+        print(f"  Vimeo subtitle fetch failed ({type(e).__name__}): {e}")
+        return None
 
 
 def _parse_vtt(vtt_path: str) -> list[dict]:
@@ -662,6 +747,36 @@ def bullet_block_with_timestamp_link(text: str, video_id: str) -> dict:
     }
 
 
+def bullet_block_with_timestamp_plain(text: str) -> dict:
+    """Create a bullet block where [MM:SS] timestamps are bold plain text.
+
+    Used for non-YouTube platforms (e.g. Vimeo) where timestamp hyperlinks
+    are not standardized.
+    """
+    match = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]\s*(.*)", text)
+    if not match:
+        return bullet_block(text)
+    ts_str = match.group(1)
+    rest = match.group(2)
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": f"[{ts_str}]"},
+                    "annotations": {"bold": True},
+                },
+                {
+                    "type": "text",
+                    "text": {"content": f" {rest}"},
+                },
+            ]
+        },
+    }
+
+
 def divider_block() -> dict:
     return {"object": "block", "type": "divider", "divider": {}}
 
@@ -684,11 +799,12 @@ def image_block(url: str) -> dict:
 
 def create_notion_page(
     title: str,
-    youtube_url: str,
+    video_url: str,
     thumbnail_url: str,
     summary: str,
     conversation_text: str,
     video_id: str = "",
+    platform: str = "youtube",
 ) -> str:
     """Create the Notion page and return its URL."""
     notion = get_notion()
@@ -696,12 +812,16 @@ def create_notion_page(
     if not parent_id:
         sys.exit("Error: NOTION_DATABASE_ID not set in .env")
 
-    # Build summary bullet blocks (timestamps are clickable YouTube links)
+    # Build summary bullet blocks
+    # YouTube: timestamps are clickable links; Vimeo/other: bold plain text
     summary_bullets = []
     for line in summary.splitlines():
         line = line.strip().lstrip("•-* ")
         if line:
-            summary_bullets.append(bullet_block_with_timestamp_link(line, video_id))
+            if platform == "youtube":
+                summary_bullets.append(bullet_block_with_timestamp_link(line, video_id))
+            else:
+                summary_bullets.append(bullet_block_with_timestamp_plain(line))
 
     # Build transcript paragraph blocks (chunked)
     transcript_blocks = [paragraph_block(chunk) for chunk in chunk_text(conversation_text)]
@@ -709,8 +829,8 @@ def create_notion_page(
     # Compose all blocks
     blocks: list[dict] = []
 
-    # YouTube bookmark
-    blocks.append(bookmark_block(youtube_url))
+    # Video bookmark
+    blocks.append(bookmark_block(video_url))
 
     # Thumbnail
     if thumbnail_url:
@@ -738,7 +858,7 @@ def create_notion_page(
                 "title": [{"type": "text", "text": {"content": title}}]
             },
             "URL": {
-                "url": youtube_url
+                "url": video_url
             },
         },
         children=blocks[:100],
@@ -761,10 +881,10 @@ def create_notion_page(
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    print("YouTube → Notion Summarizer")
+    print("Video → Notion Summarizer (YouTube + Vimeo)")
     print("=" * 40)
 
-    url = input("Paste YouTube URL: ").strip()
+    url = input("Paste YouTube or Vimeo URL: ").strip()
     if not url:
         sys.exit("No URL provided.")
 
@@ -775,9 +895,13 @@ def main():
     total_start = time.time()
     timings = {}
 
+    # Detect platform first — determines transcript strategy and timestamp links
+    platform = detect_platform(url)
+    print(f"  Detected platform: {platform}")
+
     t0 = time.time()
     print("\n[1/5] Extracting video ID...")
-    video_id = extract_video_id(url)
+    video_id = extract_video_id(url, platform)
     print(f"  Video ID: {video_id}")
     timings["1. Extract ID"] = time.time() - t0
 
@@ -789,7 +913,10 @@ def main():
 
     t0 = time.time()
     print("\n[3/5] Getting transcript...")
-    segments = get_youtube_transcript(video_id, url)
+    if platform == "youtube":
+        segments = get_youtube_transcript(video_id, url)
+    else:
+        segments = get_vimeo_transcript(url)
     if segments is None:
         segments = transcribe_with_whisper_local(url)
     timings["3. Transcript"] = time.time() - t0
@@ -812,11 +939,12 @@ def main():
     print("\n[5/5] Creating Notion page...")
     page_url = create_notion_page(
         title=meta["title"],
-        youtube_url=url,
+        video_url=url,
         thumbnail_url=meta["thumbnail"],
         summary=summary,
         conversation_text=conversation_text,
         video_id=video_id,
+        platform=platform,
     )
     timings["5. Notion upload"] = time.time() - t0
 

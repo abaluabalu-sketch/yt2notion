@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-telegram_bot.py — Telegram bot for yt2notion
+telegram_bot.py — Telegram bot for yt2notion + audio notes
 
-Send a YouTube URL from your iPhone to this bot → it runs yt2notion.py
-on your Mac and replies with the Notion page URL.
+Supports:
+  - YouTube URL → runs yt2notion.py → Notion page
+  - .m4a audio file (Apple Voice Memo) → runs audio2notion.py → Notion page
 
 Only responds to messages from your own Telegram user ID (ALLOWED_USER_ID).
 """
@@ -11,6 +12,7 @@ Only responds to messages from your own Telegram user ID (ALLOWED_USER_ID).
 import os
 import re
 import subprocess
+import tempfile
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -70,7 +72,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     yt_url = extract_youtube_url(text)
 
     if not yt_url:
-        await update.message.reply_text("Send me a YouTube URL to save it to Notion.")
+        await update.message.reply_text("Send me a YouTube URL or an .m4a voice note to save to Notion.")
         return
 
     await update.message.reply_text(f"⏳ Processing...\n{yt_url}")
@@ -92,7 +94,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notion_match = re.search(r"(https://www\.notion\.so/\S+)", output)
         if notion_match:
             notion_url = notion_match.group(1)
-            # Extract title from output
             title_match = re.search(r"Title: (.+)", output)
             title = title_match.group(1) if title_match else "Video"
             await update.message.reply_text(
@@ -101,7 +102,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             log.info(f"Done: {notion_url}")
         else:
-            # Something went wrong — send the last few lines of output
             last_lines = "\n".join(output.strip().splitlines()[-5:])
             await update.message.reply_text(f"❌ Something went wrong:\n\n{last_lines}")
             log.error(f"Failed output:\n{output}")
@@ -113,13 +113,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Unexpected error")
 
 
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle .m4a audio file attachments (Apple Voice Memos)."""
+    if not is_authorized(update):
+        log.warning(f"Unauthorized access attempt from user {update.effective_user.id}")
+        return
+
+    msg = update.message
+    # Accept documents with .m4a extension or audio/* MIME types
+    doc = msg.document
+    audio = msg.audio
+
+    if doc:
+        file_name = doc.file_name or "voice_note.m4a"
+        if not file_name.lower().endswith(".m4a"):
+            await msg.reply_text("Send me an .m4a file to transcribe to Notion.")
+            return
+        tg_file = await context.bot.get_file(doc.file_id)
+        title = Path(file_name).stem
+    elif audio:
+        file_name = audio.file_name or "voice_note.m4a"
+        tg_file = await context.bot.get_file(audio.file_id)
+        title = Path(file_name).stem
+    else:
+        return
+
+    await msg.reply_text(f"⏳ Transcribing \"{title}\"...")
+    log.info(f"Downloading audio: {file_name}")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / file_name
+            await tg_file.download_to_drive(str(audio_path))
+            log.info(f"Running audio2notion on {audio_path}")
+
+            result = subprocess.run(
+                [PYTHON_BIN, str(SCRIPT_DIR / "audio2notion.py"), str(audio_path)],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                cwd=str(SCRIPT_DIR),
+            )
+
+        output = result.stdout + result.stderr
+        notion_match = re.search(r"(https://www\.notion\.so/\S+)", output)
+        if notion_match:
+            notion_url = notion_match.group(1)
+            await msg.reply_text(
+                f"✅ Transcribed to Notion!\n\n*{title}*\n\n{notion_url}",
+                parse_mode="Markdown"
+            )
+            log.info(f"Done: {notion_url}")
+        else:
+            last_lines = "\n".join(output.strip().splitlines()[-5:])
+            await msg.reply_text(f"❌ Something went wrong:\n\n{last_lines}")
+            log.error(f"Failed output:\n{output}")
+
+    except subprocess.TimeoutExpired:
+        await msg.reply_text("⏰ Timed out after 10 minutes.")
+    except Exception as e:
+        await msg.reply_text(f"❌ Error: {e}")
+        log.exception("Unexpected error")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 def main():
     log.info("Starting yt2notion Telegram bot...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("Bot is running. Send a YouTube URL on Telegram.")
+    app.add_handler(MessageHandler(filters.Document.MimeType("audio/x-m4a") | filters.Document.MimeType("audio/mp4") | filters.AUDIO, handle_audio))
+    log.info("Bot is running. Send a YouTube URL or .m4a voice note on Telegram.")
     app.run_polling()
 
 
