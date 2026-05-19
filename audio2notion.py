@@ -186,22 +186,29 @@ def segments_to_raw_text(segments: list[dict]) -> str:
 # ── Title generation ─────────────────────────────────────────────────────────
 
 def generate_title(transcript: str) -> str:
-    """Generate a concise Notion page title from the cleaned transcript."""
+    """Generate a concise Notion page title from the full cleaned transcript."""
     print("  Generating title with Claude...")
-    sample = transcript[:3000]  # first 3K chars is enough to infer the topic
     prompt = (
         "You are titling a personal voice note for a Notion page.\n"
-        "Read the transcript excerpt and return a short, descriptive title.\n\n"
+        "Read the complete transcript and return a short, descriptive title.\n\n"
         "RULES:\n"
         "- Max 10 words\n"
         "- Match the language of the transcript (English → English title, 中文 → 中文標題)\n"
         "- Capture the main topic or intent of the note\n"
         "- No quotes, no punctuation at the end\n\n"
         "Return ONLY the title, nothing else.\n\n"
-        "TRANSCRIPT:\n" + sample
+        "TRANSCRIPT:\n" + transcript
     )
     result = call_claude(prompt, max_tokens=64)
     return result.strip().strip('"').strip("'")
+
+
+def format_title(content_title: str, audio_path: Path) -> str:
+    """Combine [memo] date prefix with AI-generated content title."""
+    from datetime import datetime
+    mtime = audio_path.stat().st_mtime
+    date_str = datetime.fromtimestamp(mtime).strftime("%d-%m-%y")
+    return f"[memo] {date_str} — {content_title}"
 
 
 # ── Transcript cleanup ────────────────────────────────────────────────────────
@@ -297,7 +304,7 @@ def create_notion_page(title: str, transcript: str) -> str:
     page = notion.pages.create(
         parent={"type": "database_id", "database_id": parent_id},
         properties={
-            "title": {"title": [{"type": "text", "text": {"content": title}}]},
+            "Name": {"title": [{"type": "text", "text": {"content": title}}]},
         },
         children=blocks[:100],
     )
@@ -337,7 +344,8 @@ def main():
     print("\n[2/3] Cleaning transcript & generating title...")
     t0 = time.time()
     transcript = clean_transcript(segments)
-    title = generate_title(transcript)
+    content_title = generate_title(transcript)
+    title = format_title(content_title, audio_path)
     print(f"  Title: {title}")
     print(f"  Done in {time.time() - t0:.1f}s")
 
