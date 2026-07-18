@@ -165,7 +165,7 @@ YouTube URL
 ### Summary
 - Always in **Traditional Chinese** (繁體中文)
 - Technical terms kept in English (Claude Code, API, SDK, etc.)
-- 5-10 key topics with **clickable timestamps** → jumps to that moment on YouTube
+- 5-10 key topics with **clickable timestamps** → jumps down to that section of the full transcript on the same page; the small **▶** beside each opens that moment on YouTube
 
 ### Conversation Formatting
 - **Speaker detection** via Claude — identifies real names from context
@@ -190,9 +190,9 @@ YouTube URL
 ### Notion Page
 - YouTube bookmark + thumbnail
 - URL property with YouTube link
-- Summary with clickable timestamp links (bold blue)
+- Summary with clickable timestamp links (bold blue) that jump to the matching transcript section, plus a ▶ link to the video
 - 投影片重點 — embedded slide images with timestamped notes
-- Full transcript as clean conversation
+- Full transcript as clean conversation, split into `[MM:SS] Topic` sections matching the summary
 
 ---
 

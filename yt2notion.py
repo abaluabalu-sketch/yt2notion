@@ -1137,13 +1137,30 @@ def _format_chunk(chunk_text: str, speaker_context: str, chunk_idx: int) -> str:
     return result.stdout.strip()
 
 
-def format_conversation(segments: list[dict]) -> str:
-    """Detect speakers, clean transcript, and format as conversation.
+def _split_raw_text(raw_text: str, chunk_size: int = 10000) -> list[str]:
+    """Split raw transcript text into ~chunk_size pieces at sentence bounds."""
+    chunks = []
+    for i in range(0, len(raw_text), chunk_size):
+        end = min(i + chunk_size, len(raw_text))
+        if end < len(raw_text):
+            last_period = raw_text.rfind(". ", i + chunk_size - 500, end)
+            if last_period > i:
+                end = last_period + 2
+        chunks.append(raw_text[i:end])
+    return chunks
 
-    Three-phase approach:
-      Phase 1: Identify speakers from a sample (~15s)
-      Phase 2: Split transcript into ~10K char chunks
-      Phase 3: Format chunks in parallel via concurrent Claude CLI calls (~30-60s)
+
+def format_conversation(segments: list[dict], topics: list[dict] | None = None) -> list[dict]:
+    """Detect speakers, clean transcript, and format as conversation sections.
+
+    Returns [{"ts_str": str|None, "title": str, "text": str}]. When `topics`
+    (from `parse_summary_topics`) is given, the transcript is split at topic
+    boundaries so each section can be an anchor target for its summary bullet;
+    otherwise a single untitled section is returned.
+
+    Phase 1: identify speakers from a sample
+    Phase 2: split into topic sections, sub-chunked to ~10K chars
+    Phase 3: format every chunk in parallel via concurrent Claude CLI calls
     """
     print("  Detecting speakers & formatting conversation (Claude)...")
     raw_text = " ".join(seg["text"] for seg in segments)
@@ -1186,41 +1203,54 @@ def format_conversation(segments: list[dict]) -> str:
     except Exception as e:
         print(f"  Speaker analysis failed ({e}), continuing without speaker hints")
 
-    # ── Phase 2: Split into chunks (~10K chars each) ─────────────────────
-    chunk_size = 10000
-    chunks = []
-    for i in range(0, len(raw_text), chunk_size):
-        end = min(i + chunk_size, len(raw_text))
-        # Try to break at a sentence boundary
-        if end < len(raw_text):
-            last_period = raw_text.rfind(". ", i + chunk_size - 500, end)
-            if last_period > i:
-                end = last_period + 2
-        chunks.append(raw_text[i:end])
+    # ── Phase 2: Split into topic sections, then ~10K char chunks ────────
+    sections: list[dict] = []
+    if topics:
+        for i, topic in enumerate(topics):
+            # First topic absorbs any lead-in before its timestamp
+            start = float("-inf") if i == 0 else topic["seconds"]
+            end = topics[i + 1]["seconds"] if i + 1 < len(topics) else float("inf")
+            text = " ".join(s["text"] for s in segments if start <= s["start"] < end)
+            if text.strip():
+                sections.append({"ts_str": topic["ts_str"], "title": topic["title"],
+                                 "raw": text})
+    if not sections:  # no topics parsed, or they matched nothing
+        sections = [{"ts_str": None, "title": "", "raw": raw_text}]
 
-    print(f"  Split into {len(chunks)} chunks, formatting in parallel...")
+    # Flatten to (section_idx, chunk_idx, text) so every chunk runs in parallel
+    tasks: list[tuple[int, int, str]] = []
+    for si, sec in enumerate(sections):
+        for ci, chunk in enumerate(_split_raw_text(sec["raw"])):
+            tasks.append((si, ci, chunk))
+
+    print(f"  Split into {len(sections)} sections / {len(tasks)} chunks, "
+          "formatting in parallel...")
 
     # ── Phase 3: Format chunks in parallel ───────────────────────────────
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def format_one(args):
-        idx, chunk = args
-        return idx, _format_chunk(chunk, speaker_context, idx)
+    def format_one(task):
+        si, ci, chunk = task
+        return si, ci, _format_chunk(chunk, speaker_context, ci)
 
-    results = [None] * len(chunks)
-    with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
-        futures = {pool.submit(format_one, (i, c)): i for i, c in enumerate(chunks)}
+    parts: dict[int, dict[int, str]] = {si: {} for si in range(len(sections))}
+    done = 0
+    with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as pool:
+        futures = [pool.submit(format_one, t) for t in tasks]
         for future in as_completed(futures):
-            idx, formatted = future.result()
-            results[idx] = formatted
-            print(f"  Chunk {idx + 1}/{len(chunks)} done")
+            si, ci, formatted = future.result()
+            parts[si][ci] = formatted
+            done += 1
+            print(f"  Chunk {done}/{len(tasks)} done")
 
-    # Merge results
-    merged = "\n\n".join(r for r in results if r)
+    for si, sec in enumerate(sections):
+        ordered = [parts[si][ci] for ci in sorted(parts[si]) if parts[si][ci]]
+        sec["text"] = "\n\n".join(ordered)
+    sections = [s for s in sections if s.get("text", "").strip()]
 
     # Count speakers in output
     speakers = set()
-    for line in merged.split("\n"):
+    for line in "\n".join(s["text"] for s in sections).split("\n"):
         if ":" in line and not line.startswith(" "):
             speaker = line.split(":")[0].strip()
             if speaker and len(speaker) < 40 and not any(c.isdigit() for c in speaker):
@@ -1228,7 +1258,7 @@ def format_conversation(segments: list[dict]) -> str:
     if speakers:
         print(f"  Formatted with {len(speakers)} speakers: {', '.join(sorted(speakers))}")
 
-    return merged
+    return sections
 
 
 # ── Notion helpers ─────────────────────────────────────────────────────────
@@ -1294,6 +1324,150 @@ def timestamp_to_seconds(ts: str) -> int:
     elif len(parts) == 2:
         return int(parts[0]) * 60 + int(parts[1])
     return 0
+
+
+def parse_summary_topics(summary: str) -> list[dict]:
+    """Extract [{seconds, ts_str, title}] from the summary's topic lines.
+
+    Shared by the transcript sectioning and the Notion anchor linking so both
+    see exactly the same topic list.
+    """
+    topics = []
+    for line in summary.splitlines():
+        line = line.strip().lstrip("•-* ")
+        m = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]\s*(.*)", line)
+        if not m:
+            continue
+        ts_str, rest = m.group(1), m.group(2)
+        # Topic title = text before the first colon (full- or half-width)
+        title = re.split(r"[：:]", rest, 1)[0].strip() or rest.strip()
+        topics.append({
+            "seconds": timestamp_to_seconds(ts_str),
+            "ts_str": ts_str,
+            "title": title[:80],
+        })
+    return topics
+
+
+def summary_bullet_block(text: str, video_id: str, platform: str = "youtube") -> dict:
+    """Summary bullet: [MM:SS] jumps to the transcript, ▶ opens the video.
+
+    The timestamp's in-page link can only be attached once the transcript
+    blocks exist (Notion block ids are assigned at creation), so it is left
+    unlinked here and patched afterwards by `link_summary_to_transcript`.
+    """
+    match = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]\s*(.*)", text)
+    if not match:
+        return bullet_block(text)
+    ts_str, rest = match.group(1), match.group(2)
+
+    rich_text = [{
+        "type": "text",
+        "text": {"content": f"[{ts_str}]"},
+        "annotations": {"bold": True, "color": "blue"},
+    }]
+    if platform == "youtube" and video_id:
+        seconds = timestamp_to_seconds(ts_str)
+        rich_text.append({
+            "type": "text",
+            "text": {"content": " ▶",
+                     "link": {"url": f"https://www.youtube.com/watch?v={video_id}&t={seconds}s"}},
+            "annotations": {"color": "gray"},
+        })
+    rich_text.append({"type": "text", "text": {"content": f" {rest}"}})
+    return {
+        "object": "block",
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": rich_text},
+    }
+
+
+def _rich_text_for_update(items: list[dict]) -> list[dict]:
+    """Rebuild API-returned rich_text into a payload accepted on update."""
+    out = []
+    for r in items:
+        if r.get("type") != "text":
+            continue
+        item = {"type": "text", "text": {"content": r["text"]["content"]}}
+        if r["text"].get("link"):
+            item["text"]["link"] = r["text"]["link"]
+        ann = {k: v for k, v in (r.get("annotations") or {}).items()
+               if k in ("bold", "italic", "strikethrough", "underline", "code", "color")}
+        if ann:
+            out.append({**item, "annotations": ann})
+        else:
+            out.append(item)
+    return out
+
+
+def _block_plain_text(block: dict) -> str:
+    body = block.get(block.get("type"), {})
+    return "".join(r.get("plain_text", "") for r in body.get("rich_text", []))
+
+
+def link_summary_to_transcript(notion, page_id: str, page_url: str) -> None:
+    """Point each summary timestamp at its transcript section (never raises).
+
+    Walks the page's top-level blocks, maps transcript section headings by
+    timestamp, then patches the matching summary bullets with an in-page
+    anchor link (`<page_url>#<block_id>`).
+    """
+    try:
+        blocks, cursor = [], None
+        while True:
+            kwargs = {"block_id": page_id, "page_size": 100}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            resp = notion.blocks.children.list(**kwargs)
+            blocks.extend(resp.get("results", []))
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+
+        # Transcript section headings, keyed by timestamp
+        anchors, in_transcript = {}, False
+        for b in blocks:
+            if b.get("type") == "heading_2":
+                in_transcript = _block_plain_text(b).strip() == "Full Transcript"
+            elif in_transcript and b.get("type") == "heading_3":
+                m = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]", _block_plain_text(b).strip())
+                if m:
+                    anchors[m.group(1)] = b["id"]
+        if not anchors:
+            return
+
+        # Patch summary bullets only (between the Summary heading and its divider)
+        in_summary, patched = False, 0
+        for b in blocks:
+            btype = b.get("type")
+            if btype == "heading_2":
+                in_summary = _block_plain_text(b).strip() == "Summary"
+                continue
+            if btype == "divider":
+                in_summary = False
+                continue
+            if not in_summary or btype != "bulleted_list_item":
+                continue
+            rich = b["bulleted_list_item"].get("rich_text", [])
+            if not rich:
+                continue
+            m = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]", rich[0].get("plain_text", ""))
+            block_id = anchors.get(m.group(1)) if m else None
+            if not block_id:
+                continue
+            new_rich = _rich_text_for_update(rich)
+            if not new_rich:
+                continue
+            new_rich[0]["text"]["link"] = {
+                "url": f"{page_url}#{block_id.replace('-', '')}"
+            }
+            notion.blocks.update(block_id=b["id"],
+                                 bulleted_list_item={"rich_text": new_rich})
+            patched += 1
+        if patched:
+            print(f"  Linked {patched} summary timestamps to transcript sections")
+    except Exception as e:
+        print(f"  ⚠ Could not link summary to transcript ({e}) — ▶ video links still work")
 
 
 def bullet_block_with_timestamp_link(text: str, video_id: str) -> dict:
@@ -1424,7 +1598,7 @@ def create_notion_page(
     video_url: str,
     thumbnail_url: str,
     summary: str,
-    conversation_text: str,
+    transcript_sections: list[dict],
     video_id: str = "",
     platform: str = "youtube",
     slides: list[dict] | None = None,
@@ -1443,17 +1617,15 @@ def create_notion_page(
     if slides:
         print(f"  Uploading up to {min(len(slides), FRAME_MAX_EMBEDS)} slide images to Notion...")
 
-    # Build summary bullet blocks (each followed by its topic frame, if any)
-    # YouTube: timestamps are clickable links; Vimeo/other: bold plain text
+    # Build summary bullet blocks (each followed by its topic frame, if any).
+    # The [MM:SS] is linked to its transcript section after the page exists;
+    # the ▶ next to it opens the video at that moment.
     summary_bullets = []
     for line in summary.splitlines():
         line = line.strip().lstrip("•-* ")
         if not line:
             continue
-        if platform == "youtube":
-            summary_bullets.append(bullet_block_with_timestamp_link(line, video_id))
-        else:
-            summary_bullets.append(bullet_block_with_timestamp_plain(line))
+        summary_bullets.append(summary_bullet_block(line, video_id, platform))
         m = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]", line)
         slide = topic_slides.get(timestamp_to_seconds(m.group(1))) if m else None
         if slide is not None and embeds_left > 0:
@@ -1464,7 +1636,16 @@ def create_notion_page(
                 embeds_left -= 1
 
     # Build transcript paragraph blocks (chunked)
-    transcript_blocks = [paragraph_block(chunk) for chunk in chunk_text(conversation_text)]
+    # Transcript renders as one section per summary topic; each section's
+    # heading is the anchor a summary timestamp jumps to
+    transcript_blocks: list[dict] = []
+    for sec in transcript_sections:
+        if sec.get("ts_str"):
+            # NB: must not shadow the `title` parameter — it is the page title
+            section_heading = f"[{sec['ts_str']}] {sec.get('title', '')}".strip()
+            transcript_blocks.append(heading_block(section_heading, level=3))
+        for chunk in chunk_text(sec["text"]):
+            transcript_blocks.append(paragraph_block(chunk))
 
     # Compose all blocks
     blocks: list[dict] = []
@@ -1532,6 +1713,9 @@ def create_notion_page(
             children=remaining[:100],
         )
         remaining = remaining[100:]
+
+    # Now that transcript blocks have ids, point summary timestamps at them
+    link_summary_to_transcript(notion, page_id, page_url)
 
     return page_url
 
@@ -1625,8 +1809,9 @@ def main():
         timings["5. Summary (Claude)"] = time.time() - t0
 
         t0 = time.time()
-        # Detect speakers and format as conversation via Claude
-        conversation_text = format_conversation(segments)
+        # Detect speakers and format as conversation, split into topic sections
+        # so each summary timestamp has a transcript anchor to jump to
+        transcript_sections = format_conversation(segments, parse_summary_topics(summary))
         timings["5b. Conversation (Claude)"] = time.time() - t0
 
         t0 = time.time()
@@ -1636,7 +1821,7 @@ def main():
             video_url=url,
             thumbnail_url=meta["thumbnail"],
             summary=summary,
-            conversation_text=conversation_text,
+            transcript_sections=transcript_sections,
             video_id=video_id,
             platform=platform,
             slides=slides,

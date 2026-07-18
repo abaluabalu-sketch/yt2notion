@@ -38,7 +38,7 @@ The pipeline runs in 6 sequential steps (LLM calls use Claude CLI first, gpt-4o-
 2. **Fetch metadata** — `yt-dlp --dump-json` returns title, thumbnail, language
 3. **Get transcript** — 3-tier fallback strategy (see below)
 4. **Frame analysis** — "watch" the video (see below); skip with `--no-frames` or `YT2NOTION_NO_FRAMES=1`
-5. **Summarize + format conversation** — Claude extracts 5–10 key topics with timestamps (transcript + slide notes); transcript reformatted with inferred speaker labels
+5. **Summarize + format conversation** — Claude extracts 5–10 key topics with timestamps (transcript + slide notes); the transcript is then split at those topic boundaries (`parse_summary_topics` → `format_conversation(segments, topics)`) and each section reformatted with inferred speaker labels, so every summary topic has a transcript section to anchor to
 6. **Create Notion page** — batched API calls (max 100 blocks per request), slide images via File Upload API
 
 ### Frame Analysis (hybrid local/cloud, degrades gracefully)
@@ -81,7 +81,8 @@ At startup the script prepends to PATH (highest priority last): `/opt/homebrew/b
 
 - Max 100 blocks per API request — first batch in `pages.create()`, rest via `blocks.children.append()`
 - Paragraph text chunked to max 1900 chars (Notion limit is 2000); splits at sentence then word boundaries
-- Summary timestamp links rendered as bold blue `rich_text` with `"link": {"url": "...&t=Xs"}`
+- Summary timestamps are bold blue `rich_text` linking **in-page** to their transcript section (`<page_url>#<block_id_without_dashes>`); a gray ` ▶` next to each links out to `...&t=Xs` on YouTube
+- In-page anchors need block ids that exist only after creation, so `create_notion_page` creates the bullets unlinked and `link_summary_to_transcript` patches them in a second pass (`blocks.children.list` → match `[MM:SS]` → `blocks.update`). Summary bullets are identified only between the `Summary` heading and its following divider, so identically-timestamped `投影片重點` bullets are never patched
 
 ## Key Functions
 
@@ -104,7 +105,10 @@ At startup the script prepends to PATH (highest priority last): `/opt/homebrew/b
 | `format_conversation` | ~939 | Claude conversation formatting |
 | `_upload_file_to_notion` | ~1137 | Notion File Upload API (httpx) → file_upload id |
 | `create_notion_page` | ~1230 | Build + upload all Notion blocks incl. 投影片重點 |
-| `bullet_block_with_timestamp_link` | ~1095 | Render clickable timestamp links |
+| `parse_summary_topics` | ~1299 | Summary lines → `[{seconds, ts_str, title}]` (shared by sectioning + linking) |
+| `summary_bullet_block` | ~1322 | Summary bullet: unlinked `[MM:SS]` + gray ▶ YouTube link |
+| `link_summary_to_transcript` | ~1380 | 2nd pass: patch summary timestamps with in-page anchors |
+| `bullet_block_with_timestamp_link` | ~1440 | Render clickable YouTube timestamp links (投影片重點) |
 
 ## Dependencies
 
