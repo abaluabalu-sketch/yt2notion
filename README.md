@@ -2,6 +2,9 @@
 
 Paste a YouTube URL → get a structured Notion page with:
 - **Summary** in Traditional Chinese with clickable timestamps
+- **投影片重點 (slide highlights)** — the tool *watches* the video: it extracts
+  the frames where slides flip, reads them with local Apple Vision OCR, and
+  embeds the slide screenshots with timestamped notes
 - **Full transcript** formatted as a conversation with speaker names
 - Cleaned up (filler words removed, false starts collapsed, grammar fixed)
 
@@ -29,11 +32,13 @@ echo "https://youtu.be/VIDEO_ID" | python3 yt2notion.py
 
 | Requirement | Purpose | How to Get |
 |---|---|---|
-| Python 3.10+ | Run the script | [python.org](https://python.org) |
-| Claude subscription | Summarization + formatting (via CLI) | [claude.ai](https://claude.ai) |
-| Notion API key | Create pages | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
+| Python 3.9+ | Run the script | macOS system `python3` works |
+| Claude subscription | Summarization + slide vision + formatting (via CLI) | [claude.ai](https://claude.ai) |
+| Notion API key | Create pages + upload slide images | [notion.so/my-integrations](https://www.notion.so/my-integrations) |
 | Notion Database ID | Target database | From your database URL |
 | Google Chrome | YouTube cookies (members-only videos) | Already installed |
+| `deno` | yt-dlp JS-challenge runtime | `brew install deno` |
+| macOS (Apple Vision) | Local slide OCR (frame analysis) | Built in |
 
 > **No OpenAI or Anthropic API key needed.** Summarization uses the `claude` CLI from your Claude Code subscription.
 
@@ -86,6 +91,10 @@ NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ### From terminal
 ```bash
 echo "https://youtu.be/VIDEO_ID" | python3 yt2notion.py
+# or pass the URL directly:
+python3 yt2notion.py "https://youtu.be/VIDEO_ID"
+# skip frame analysis (talking-head videos with no useful slides):
+python3 yt2notion.py "https://youtu.be/VIDEO_ID" --no-frames
 ```
 
 ### From Claude Code chat
@@ -113,14 +122,25 @@ YouTube URL
     └─ Tier 3: whisper.cpp large-v3-turbo (local, Metal GPU)
     │
     ▼
-[3] Claude CLI ─────────► Summary (Traditional Chinese, 5-10 topics)
+[3] Frame analysis  ────► "Watch" the video (skip with --no-frames)
+    ├─ yt-dlp: video-only ≤720p stream
+    ├─ stable-state sampling: 1fps thumbnails → distinct visual states
+    ├─ one clean frame per state (slides, terminals, animations, UI)
+    ├─ Apple Vision OCR (local, free) reads slide text
+    ├─ Claude CLI describes chart/diagram frames (gpt-4o-mini fallback)
+    └─ after summary: each topic gets the frame on screen at its start
+    │
+    ▼
+[4] Claude CLI ─────────► Summary (Traditional Chinese, 5-10 topics)
+    │                      from transcript + slide notes,
     │                      with clickable YouTube timestamps
     ▼
-[4] Claude CLI ─────────► Speaker detection + conversation formatting
+[5] Claude CLI ─────────► Speaker detection + conversation formatting
     │                      (parallel chunked processing)
     │                      + transcript cleaning rules
     ▼
-[5] Notion API ─────────► Structured page with URL property
+[6] Notion API ─────────► Structured page with URL property,
+                          embedded slide images (File Upload API)
 ```
 
 ### Performance (65-min video)
@@ -157,10 +177,21 @@ YouTube URL
   - Em-dash for interruptions
   - [inaudible] / [crosstalk] markers
 
+### Frame Analysis ("watch the video")
+- **Completed-slide capture** — 1fps fingerprinting segments the video into settled visual states, each captured at its **last quiet moment before the next change**; build-up stages (author adding elements to a slide) are then merged by OCR-text containment, keeping the **completed** image — after the author has added the final element — with the timestamp of when the slide first appeared. OCR-richness fallback if a capture caught a fade
+- **Apple Vision OCR** (local, free, via pyobjc) — reads slide text; language order is chosen from the transcript's script (Chinese videos OCR zh-Hant-first, others English-first), since yt-dlp's metadata language is often empty
+- **Claude CLI vision** — describes chart/diagram/demo frames that OCR can't explain (gpt-4o-mini vision fallback); frames judged non-informative (talking heads, transitions) are dropped
+- **Illustrated summary** — after summarization, each key topic gets the frame that was on screen when it started, embedded right under its bullet
+- **投影片重點 section** — remaining informative slides with timestamped notes, uploaded via the Notion File Upload API
+- Slide content is also fed into the summary so key topics reflect what was *shown*, not just said
+- Degrades gracefully: any failure (download, ffmpeg, OCR, upload) falls back to the audio-only page
+- Skip per-video with `--no-frames`, or globally with `YT2NOTION_NO_FRAMES=1`
+
 ### Notion Page
 - YouTube bookmark + thumbnail
 - URL property with YouTube link
 - Summary with clickable timestamp links (bold blue)
+- 投影片重點 — embedded slide images with timestamped notes
 - Full transcript as clean conversation
 
 ---
@@ -253,7 +284,9 @@ claude  # login on first run
 | `Error fetching metadata` | Make sure Chrome is logged into YouTube |
 | `whisper.cpp not found` | Run `bash setup.sh` or see manual install |
 | `Error calling claude CLI` | Run `claude` once to login |
-| `n challenge solving failed` | Node.js not installed — run `bash setup.sh` |
+| `n challenge solving failed` / `Requested format is not available` | yt-dlp too old or no JS runtime — `uv tool install yt-dlp` and `brew install deno` |
+| `no such option: --remote-components` | yt-dlp too old — `uv tool install yt-dlp` |
+| Slide OCR skipped | `pip3 install pyobjc-framework-Vision pyobjc-framework-Quartz` (macOS only) |
 | Notion page missing URL | Add a "URL" property (type: URL) to your database |
 
 ---

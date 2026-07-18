@@ -5,3 +5,6 @@ youtube-transcript-api
 yt-dlp
 python-dotenv
 imageio-ffmpeg
+# Frame analysis: Apple Vision OCR (macOS only)
+pyobjc-framework-Vision
+pyobjc-framework-Quartz
