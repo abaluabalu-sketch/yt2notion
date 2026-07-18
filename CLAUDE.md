@@ -5,7 +5,7 @@
 **When the user pastes a YouTube URL (youtube.com, youtu.be) and mentions Notion, saving, summarizing, or transcribing — IMMEDIATELY run the command below. Do NOT search the web, do NOT try to fetch the video yourself, do NOT use MCP tools. Just run this bash command:**
 
 ```bash
-cd /Users/Abalu/Claude-0316 && echo "YOUTUBE_URL_HERE" | python yt2notion.py
+cd /Users/luke-mini/Claude/Tools/yt2notion && echo "YOUTUBE_URL_HERE" | python3 yt2notion.py
 ```
 
 Replace `YOUTUBE_URL_HERE` with the actual URL from the user's message. Set a timeout of 600000ms (10 minutes) since long videos take time to process. Report the Notion page URL when done.
@@ -32,14 +32,30 @@ NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ## Architecture
 
-The pipeline runs in 6 sequential steps:
+The pipeline runs in 6 sequential steps (LLM calls use Claude CLI first, gpt-4o-mini as fallback):
 
 1. **Extract video ID** — regex against the URL
 2. **Fetch metadata** — `yt-dlp --dump-json` returns title, thumbnail, language
 3. **Get transcript** — 3-tier fallback strategy (see below)
-4. **Summarize** — GPT-4o-mini extracts 5–10 key topics with timestamps; language auto-matches transcript
-5. **Format conversation** — GPT-4o-mini reformats transcript with inferred speaker labels
-6. **Create Notion page** — batched API calls (max 100 blocks per request)
+4. **Frame analysis** — "watch" the video (see below); skip with `--no-frames` or `YT2NOTION_NO_FRAMES=1`
+5. **Summarize + format conversation** — Claude extracts 5–10 key topics with timestamps (transcript + slide notes); the transcript is then split at those topic boundaries (`parse_summary_topics` → `format_conversation(segments, topics)`) and each section reformatted with inferred speaker labels, so every summary topic has a transcript section to anchor to
+6. **Create Notion page** — batched API calls (max 100 blocks per request), slide images via File Upload API
+
+### Frame Analysis (hybrid local/cloud, degrades gracefully)
+
+Any failure in this step (download, ffmpeg, OCR, upload) prints a warning and the run continues with the audio-only page.
+
+| Stage | Method | Notes |
+|---|---|---|
+| Video download | `yt-dlp -f "bv*[height<=720]..."` video-only stream | kept until topic frames attached (Layer 2) |
+| Slide segments | 1fps 32×18 gray thumbs (one ffmpeg pass, videotoolbox) → stages → slide groups | a **stage** closes when the picture drifts >10% from the stage's first frame; consecutive stages are then **grouped into one slide** while `_is_build_continuation` holds — ≤35% of the picture changed, ≤2% of content vanished, something new appeared (the author is still adding elements). ≥5s applies to the whole **group**, never a single stage, so a completed state that is briefly on screen is never discarded; re-shown slides deduped (≤10% diff); capped at 40 |
+| Keyframes | `ffmpeg -ss {group capture} -frames:v 1` full-res extract, one per slide | `_pick_capture_index` scans the group's FINAL stage and takes the *quiet* frame with the most content (latest wins ties) — content peaks once the last element has landed. Bullet timestamp = group START (when the slide first appeared) |
+| Read slides | Apple Vision OCR (pyobjc, local, free) | language order from transcript CJK-ratio (`_is_cjk_heavy`), not yt-dlp's often-empty metadata: zh-Hant-first for Chinese videos, else en-US-first; consecutive near-identical OCR deduped |
+| Visual frames | Claude CLI reads image files (`--print` mode, cwd=frames dir) | only frames with <40 chars OCR text, capped at 10/video, batches of 5; gpt-4o-mini vision fallback; model outputs SKIP for non-informative frames (talking heads/transitions) which are dropped |
+| Topic frames | `attach_topic_frames` after `summarize` | each summary topic gets the state with the longest overlap of its span `[t, next topic)` (capped at 90s); missing states extracted on demand; SKIP states excluded; summary output sanitized by `_clean_summary` (drops preamble/code fences) |
+| Notion embed | File Upload API (`POST /v1/file_uploads` + `/send`) via httpx | max 25 topic images; the bullet still renders if an upload fails |
+
+Slide notes are injected into the summary prompt (SLIDES section) — that is how the summary reflects what was *shown*, not only what was said. Only **topic-tagged** slides are rendered, as an image directly under their Summary bullet; every other slide contributes to the prompt but is never displayed (there is deliberately no separate slide-gallery section — it duplicated the Summary).
 
 ### Transcript Strategy (2-tier, NO auto-generated subtitles)
 
@@ -54,30 +70,51 @@ The pipeline runs in 6 sequential steps:
 ### External System Paths
 
 - `~/.local/whisper-cpp/whisper-cli` — whisper.cpp binary
-- `~/.local/whisper-cpp/models/ggml-large-v3.bin` — large-v3 model (~2.9GB)
-- `~/.local/node/bin` — added to PATH at startup for yt-dlp JS challenge solving
+- `~/.local/whisper-cpp/models/ggml-large-v3-turbo.bin` — large-v3-turbo model (1.6GB)
+- `~/.local/bin/yt-dlp` — current yt-dlp (uv tool install; the pip user-site one is frozen at Python 3.9 and too old)
+- `/opt/homebrew/bin/deno` — JS runtime for yt-dlp EJS challenge solving (node 20 is too old)
+- `~/.local/node/bin` — legacy Node.js, still prepended to PATH at startup
+
+At startup the script prepends to PATH (highest priority last): `/opt/homebrew/bin`, pip user-scripts dir, `~/.local/bin` — so it works from launchd/Telegram-bot contexts with a minimal PATH.
 
 ### Notion API Constraints
 
 - Max 100 blocks per API request — first batch in `pages.create()`, rest via `blocks.children.append()`
 - Paragraph text chunked to max 1900 chars (Notion limit is 2000); splits at sentence then word boundaries
-- Summary timestamp links rendered as bold blue `rich_text` with `"link": {"url": "...&t=Xs"}`
+- Summary timestamps are bold blue `rich_text` linking **in-page** to their transcript section (`<page_url>#<block_id_without_dashes>`); a gray ` ▶` next to each links out to `...&t=Xs` on YouTube
+- In-page anchors need block ids that exist only after creation, so `create_notion_page` creates the bullets unlinked and `link_summary_to_transcript` patches them in a second pass (`blocks.children.list` → match `[MM:SS]` → `blocks.update`). Summary bullets are scoped to the range between the `Summary` heading and its following divider
 
 ## Key Functions
 
-| Function | Location | Purpose |
+(Line numbers approximate — grep the name if it has drifted.)
+
+| Function | Line | Purpose |
 |---|---|---|
-| `get_youtube_transcript` | line 132 | Tier 1+2 transcript fetching |
-| `transcribe_with_whisper_local` | line 272 | Tier 3 whisper.cpp fallback |
-| `_parse_vtt` | line 208 | Parse WebVTT subtitle files |
-| `summarize` | line 343 | GPT-4o-mini summarization |
-| `format_conversation` | line 369 | GPT-4o-mini conversation formatting |
-| `create_notion_page` | line 516 | Build and upload all Notion blocks |
-| `bullet_block_with_timestamp_link` | line 467 | Render clickable timestamp links |
-| `chunk_text` | line 404 | Split text for Notion's block size limit |
+| `get_youtube_transcript` | ~193 | Tier 1+2 transcript fetching |
+| `transcribe_with_whisper_local` | ~441 | Tier 3 whisper.cpp fallback |
+| `analyze_video_frames` | ~850 | Frame-analysis orchestrator (download → states → OCR → vision); returns frame ctx dict |
+| `attach_topic_frames` | ~915 | Layer 2: tag/extract the frame on screen at each summary topic |
+| `_download_video` | ~550 | Video-only ≤720p stream for frame extraction |
+| `_sample_thumbs` / `_find_stable_states` | ~590 | 1fps gray thumbs → stages → slide groups (one entry per slide) |
+| `_extract_keyframes` | ~665 | one full-res frame per slide, at its completed state |
+| `_ocr_image` / `_ocr_languages` | ~621 | Apple Vision OCR + per-video language ordering |
+| `_is_build_continuation` / `_ink_mask` | ~600 | Pixel test: is this stage the same slide with more elements? |
+| `_pick_capture_index` | ~700 | Most complete settled frame of a slide's final stage |
+| `_dedup_slides` | ~800 | OCR safety net: merge build stages / re-detections, keeping the richer image + earliest ts |
+| `_describe_frames_with_vision` | ~682 | Claude CLI (cwd=frames dir) / gpt-4o-mini vision |
+| `slides_to_text` | ~813 | Slide notes → summary-prompt SLIDES section |
+| `summarize` | ~872 | Claude summarization (transcript + slide notes) |
+| `format_conversation` | ~939 | Claude conversation formatting |
+| `_upload_file_to_notion` | ~1137 | Notion File Upload API (httpx) → file_upload id |
+| `create_notion_page` | ~1230 | Build + upload all Notion blocks |
+| `parse_summary_topics` | ~1299 | Summary lines → `[{seconds, ts_str, title}]` (shared by sectioning + linking) |
+| `summary_bullet_block` | ~1322 | Summary bullet: unlinked `[MM:SS]` + gray ▶ YouTube link |
+| `link_summary_to_transcript` | ~1380 | 2nd pass: patch summary timestamps with in-page anchors |
 
 ## Dependencies
 
-**Python packages** (see `requirements.txt`): `openai`, `notion-client`, `python-dotenv`, `yt-dlp`, `youtube-transcript-api`, `imageio-ffmpeg`
+**Python packages** (see `requirements.txt`): `openai`, `notion-client`, `python-dotenv`, `yt-dlp`, `youtube-transcript-api`, `imageio-ffmpeg`, `pyobjc-framework-Vision`, `pyobjc-framework-Quartz` (frame OCR, macOS only)
 
-**System dependencies**: `whisper.cpp` compiled with Metal GPU support, `Node.js` (for yt-dlp JS challenges)
+**System dependencies**: `whisper.cpp` compiled with Metal GPU support, `deno` (yt-dlp EJS challenges), current `yt-dlp` via `uv tool install yt-dlp`
+
+**Python version note**: the runtime on this machine is `/usr/bin/python3` (3.9). The script carries `from __future__ import annotations` for 3.9 compatibility — keep it when editing.
