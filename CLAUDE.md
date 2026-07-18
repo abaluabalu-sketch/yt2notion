@@ -48,14 +48,14 @@ Any failure in this step (download, ffmpeg, OCR, upload) prints a warning and th
 | Stage | Method | Notes |
 |---|---|---|
 | Video download | `yt-dlp -f "bv*[height<=720]..."` video-only stream | kept until topic frames attached (Layer 2) |
-| Slide segments | 1fps 32×18 gray thumbs (one ffmpeg pass, videotoolbox) → drift segmentation | segment closes when the picture drifts >10% (changed pixels) from the segment's first frame — every settled build stage is its own segment, captured at its end; `_dedup_slides` then merges a stage whose OCR text is contained in the next stage's (`_text_contains` ≥0.8) keeping the completed image + earliest timestamp; must persist ≥5s; re-shown slides deduped (≤10% diff); capped at 40 |
-| Keyframes | `ffmpeg -ss {segment capture} -frames:v 1` full-res extract per segment | captured at the last quiet moment BEFORE the segment ends = the completed slide with all elements (not mid-build); OCR-richness fallback to mid frame if end capture caught a fade; bullet timestamp = segment START |
+| Slide segments | 1fps 32×18 gray thumbs (one ffmpeg pass, videotoolbox) → stages → slide groups | a **stage** closes when the picture drifts >10% from the stage's first frame; consecutive stages are then **grouped into one slide** while `_is_build_continuation` holds — ≤35% of the picture changed, ≤2% of content vanished, something new appeared (the author is still adding elements). ≥5s applies to the whole **group**, never a single stage, so a completed state that is briefly on screen is never discarded; re-shown slides deduped (≤10% diff); capped at 40 |
+| Keyframes | `ffmpeg -ss {group capture} -frames:v 1` full-res extract, one per slide | `_pick_capture_index` scans the group's FINAL stage and takes the *quiet* frame with the most content (latest wins ties) — content peaks once the last element has landed. Bullet timestamp = group START (when the slide first appeared) |
 | Read slides | Apple Vision OCR (pyobjc, local, free) | language order from transcript CJK-ratio (`_is_cjk_heavy`), not yt-dlp's often-empty metadata: zh-Hant-first for Chinese videos, else en-US-first; consecutive near-identical OCR deduped |
 | Visual frames | Claude CLI reads image files (`--print` mode, cwd=frames dir) | only frames with <40 chars OCR text, capped at 10/video, batches of 5; gpt-4o-mini vision fallback; model outputs SKIP for non-informative frames (talking heads/transitions) which are dropped |
 | Topic frames | `attach_topic_frames` after `summarize` | each summary topic gets the state with the longest overlap of its span `[t, next topic)` (capped at 90s); missing states extracted on demand; SKIP states excluded; summary output sanitized by `_clean_summary` (drops preamble/code fences) |
-| Notion embed | File Upload API (`POST /v1/file_uploads` + `/send`) via httpx | max 25 images shared across sections; falls back to text-only bullet on upload failure |
+| Notion embed | File Upload API (`POST /v1/file_uploads` + `/send`) via httpx | max 25 topic images; the bullet still renders if an upload fails |
 
-Slide notes are injected into the summary prompt (SLIDES section). Topic-tagged slides render as an image directly under their Summary bullet; remaining informative slides render as a `投影片重點` section (timestamped bullet + embedded image) between Summary and Full Transcript (omitted when empty).
+Slide notes are injected into the summary prompt (SLIDES section) — that is how the summary reflects what was *shown*, not only what was said. Only **topic-tagged** slides are rendered, as an image directly under their Summary bullet; every other slide contributes to the prompt but is never displayed (there is deliberately no separate slide-gallery section — it duplicated the Summary).
 
 ### Transcript Strategy (2-tier, NO auto-generated subtitles)
 
@@ -82,7 +82,7 @@ At startup the script prepends to PATH (highest priority last): `/opt/homebrew/b
 - Max 100 blocks per API request — first batch in `pages.create()`, rest via `blocks.children.append()`
 - Paragraph text chunked to max 1900 chars (Notion limit is 2000); splits at sentence then word boundaries
 - Summary timestamps are bold blue `rich_text` linking **in-page** to their transcript section (`<page_url>#<block_id_without_dashes>`); a gray ` ▶` next to each links out to `...&t=Xs` on YouTube
-- In-page anchors need block ids that exist only after creation, so `create_notion_page` creates the bullets unlinked and `link_summary_to_transcript` patches them in a second pass (`blocks.children.list` → match `[MM:SS]` → `blocks.update`). Summary bullets are identified only between the `Summary` heading and its following divider, so identically-timestamped `投影片重點` bullets are never patched
+- In-page anchors need block ids that exist only after creation, so `create_notion_page` creates the bullets unlinked and `link_summary_to_transcript` patches them in a second pass (`blocks.children.list` → match `[MM:SS]` → `blocks.update`). Summary bullets are scoped to the range between the `Summary` heading and its following divider
 
 ## Key Functions
 
@@ -95,20 +95,21 @@ At startup the script prepends to PATH (highest priority last): `/opt/homebrew/b
 | `analyze_video_frames` | ~850 | Frame-analysis orchestrator (download → states → OCR → vision); returns frame ctx dict |
 | `attach_topic_frames` | ~915 | Layer 2: tag/extract the frame on screen at each summary topic |
 | `_download_video` | ~550 | Video-only ≤720p stream for frame extraction |
-| `_sample_thumbs` / `_find_stable_states` | ~590 | 1fps gray thumbs → stable visual states (changed-pixel ratio) |
-| `_extract_keyframes` | ~665 | states → full-res mid-state frame extraction |
+| `_sample_thumbs` / `_find_stable_states` | ~590 | 1fps gray thumbs → stages → slide groups (one entry per slide) |
+| `_extract_keyframes` | ~665 | one full-res frame per slide, at its completed state |
 | `_ocr_image` / `_ocr_languages` | ~621 | Apple Vision OCR + per-video language ordering |
-| `_dedup_slides` | ~664 | Merge build stages (OCR-subset → keep completed image, earliest ts) + near-identical slides |
+| `_is_build_continuation` / `_ink_mask` | ~600 | Pixel test: is this stage the same slide with more elements? |
+| `_pick_capture_index` | ~700 | Most complete settled frame of a slide's final stage |
+| `_dedup_slides` | ~800 | OCR safety net: merge build stages / re-detections, keeping the richer image + earliest ts |
 | `_describe_frames_with_vision` | ~682 | Claude CLI (cwd=frames dir) / gpt-4o-mini vision |
 | `slides_to_text` | ~813 | Slide notes → summary-prompt SLIDES section |
 | `summarize` | ~872 | Claude summarization (transcript + slide notes) |
 | `format_conversation` | ~939 | Claude conversation formatting |
 | `_upload_file_to_notion` | ~1137 | Notion File Upload API (httpx) → file_upload id |
-| `create_notion_page` | ~1230 | Build + upload all Notion blocks incl. 投影片重點 |
+| `create_notion_page` | ~1230 | Build + upload all Notion blocks |
 | `parse_summary_topics` | ~1299 | Summary lines → `[{seconds, ts_str, title}]` (shared by sectioning + linking) |
 | `summary_bullet_block` | ~1322 | Summary bullet: unlinked `[MM:SS]` + gray ▶ YouTube link |
 | `link_summary_to_transcript` | ~1380 | 2nd pass: patch summary timestamps with in-page anchors |
-| `bullet_block_with_timestamp_link` | ~1440 | Render clickable YouTube timestamp links (投影片重點) |
 
 ## Dependencies
 

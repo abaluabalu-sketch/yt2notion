@@ -20,9 +20,10 @@ Prompts for a YouTube URL (or reads it from argv/stdin), then:
      - Speaker labels: real names > inferred roles > Person 1/2 > no labels
   6. Creates a structured Notion page with:
      - YouTube bookmark + thumbnail
-     - Summary with clickable timestamp links (youtube.com?v=ID&t=Xs)
-     - 投影片重點: embedded slide images (Notion File Upload API) + timestamped notes
-     - Full transcript as readable conversation
+     - Summary whose timestamps jump to the matching transcript section,
+       each with a ▶ link out to that moment on YouTube
+     - The slide that was on screen embedded under its summary topic
+     - Full transcript as readable conversation, split into topic sections
 
 Dependencies:
   pip: openai, notion-client, python-dotenv, yt-dlp, youtube-transcript-api,
@@ -539,9 +540,11 @@ FRAME_SAMPLE_FPS      = 1.0    # sampling rate for the visual-state pass
 FRAME_PIXEL_DELTA     = 24     # gray-level change for a pixel to count as changed
 FRAME_SOFT_CHANGE_RATIO = 0.04 # ≤ this frame-to-frame ratio = quiet (element settling)
 FRAME_SPLIT_DRIFT_RATIO = 0.10 # > this drift from segment start = new visual state
-FRAME_CAPTURE_BACKOFF = 1.0    # capture at least this long before the segment boundary
+FRAME_INK_REMOVED_MAX = 0.02   # ≤ this fraction of content lost → same slide, still growing
+FRAME_BUILD_CHANGE_MAX = 0.35  # > this much of the picture changed → a new slide, not a build step
+FRAME_INK_IGNORE_BOTTOM = 0.15 # ignore bottom rows (burned-in subtitles) when measuring content
 FRAME_DEDUP_RATIO     = 0.10   # ≤ this ratio between captured frames = re-shown slide
-FRAME_MIN_STABLE_SECONDS = 5.0 # a visual state must persist this long to count
+FRAME_MIN_STABLE_SECONDS = 5.0 # a whole slide (all its build stages) must persist this long
 FRAME_TOPIC_MAX_SPAN_SECONDS = 90  # topic → state matching: search from topic start to next topic, capped here
 FRAME_MAX_KEYFRAMES   = 40     # hard cap on analyzed keyframes per video
 FRAME_MAX_VISION      = 10     # max frames sent to Claude/GPT vision per video
@@ -587,6 +590,46 @@ def _changed_ratio(a: bytes, b: bytes) -> float:
     return changed / len(a)
 
 
+def _ink_mask(thumb: bytes) -> int:
+    """Bitmask of 'content' pixels — those standing out from the background.
+
+    Background is the frame's median gray level, so this works for both
+    light-on-dark and dark-on-light slides. The bottom
+    FRAME_INK_IGNORE_BOTTOM of rows is excluded because burned-in subtitles
+    live there and would otherwise read as content constantly appearing and
+    disappearing.
+    """
+    rows = _THUMB_H - int(_THUMB_H * FRAME_INK_IGNORE_BOTTOM)
+    usable = thumb[:rows * _THUMB_W]
+    ordered = sorted(usable)
+    background = ordered[len(ordered) // 2]
+    mask = 0
+    for i, pixel in enumerate(usable):
+        if abs(pixel - background) > FRAME_PIXEL_DELTA:
+            mask |= 1 << i
+    return mask
+
+
+def _ink_size(mask: int) -> int:
+    return bin(mask).count("1")
+
+
+def _is_build_continuation(earlier: bytes, later: bytes) -> bool:
+    """True when `later` is `earlier` with more elements added to it.
+
+    Three conditions, all needed: the rest of the picture is untouched (an
+    added element changes a limited region — a slide flip repaints everything,
+    even when the new slide happens to put content in the same places),
+    nothing that was there vanished, and something new did appear.
+    """
+    if _changed_ratio(earlier, later) > FRAME_BUILD_CHANGE_MAX:
+        return False  # a different picture, not the same slide growing
+    a, b = _ink_mask(earlier), _ink_mask(later)
+    total = _THUMB_W * (_THUMB_H - int(_THUMB_H * FRAME_INK_IGNORE_BOTTOM))
+    removed = _ink_size(a & ~b) / total
+    return removed <= FRAME_INK_REMOVED_MAX and (b & ~a) != 0
+
+
 def _sample_thumbs(video_path: Path) -> list[bytes]:
     """One ffmpeg pass: FRAME_SAMPLE_FPS grayscale thumbnails as raw bytes.
 
@@ -610,48 +653,75 @@ def _sample_thumbs(video_path: Path) -> list[bytes]:
     return [raw[i:i + size] for i in range(0, len(raw) - size + 1, size)]
 
 
-def _find_stable_states(thumbs: list[bytes]) -> list[dict]:
-    """Group 1fps thumbnails into visual-state segments.
+def _pick_capture_index(thumbs: list[bytes], lo: int, hi: int) -> int:
+    """Index of the most complete settled frame in [lo, hi].
 
-    A segment closes when the picture drifts materially from the segment's
-    first frame. Each build stage of a progressively-built slide becomes its
-    own segment, captured at the last QUIET moment before its boundary (the
-    stage with all its elements so far); `_dedup_slides` later collapses the
-    stage chain into the single completed slide via OCR-subset merging.
+    Only quiet frames are eligible, so a mid-fade frame is never chosen. Among
+    those, the one with the most content wins (latest on ties) — content peaks
+    once the author has added the final element.
+    """
+    best_i, best_ink = lo, -1
+    for i in range(lo, hi + 1):
+        quiet = i == lo or _changed_ratio(thumbs[i], thumbs[i - 1]) <= FRAME_SOFT_CHANGE_RATIO
+        if not quiet:
+            continue
+        ink = _ink_size(_ink_mask(thumbs[i]))
+        if ink >= best_ink:  # >= so a later frame wins an equal-content tie
+            best_i, best_ink = i, ink
+    return best_i
+
+
+def _find_stable_states(thumbs: list[bytes]) -> list[dict]:
+    """Group 1fps thumbnails into one entry per distinct slide.
+
+    Stages are split wherever the picture drifts from the stage's first frame,
+    then consecutive stages are grouped while content only grows — the
+    signature of an author progressively building one slide. Each group is
+    captured at the most complete settled frame of its FINAL stage, so the
+    screenshot shows the slide after the last element landed.
+
+    The minimum-duration filter is applied to the whole group, never to a
+    single stage: a completed state that is only briefly on screen before the
+    author moves on must not be discarded.
     Returns [{"start","end","capture","mid","thumb"}].
     """
     if not thumbs:
         return []
     dt = 1.0 / FRAME_SAMPLE_FPS
 
-    segments: list[dict] = []
+    # ── Stages: split on drift from the stage's own first frame ──────────
+    stages: list[tuple[int, int]] = []  # (start_i, end_i) inclusive
+    anchor, stage_start = thumbs[0], 0
+    for i in range(1, len(thumbs)):
+        if _changed_ratio(thumbs[i], anchor) > FRAME_SPLIT_DRIFT_RATIO:
+            stages.append((stage_start, i - 1))
+            anchor, stage_start = thumbs[i], i
+    stages.append((stage_start, len(thumbs) - 1))
 
-    def close_segment(seg_start: int, end_i: int, quiet_i: int) -> None:
-        start_ts, end_ts = seg_start * dt, (end_i + 1) * dt
-        capture_i = max(seg_start, quiet_i)
-        capture_ts = max(start_ts, min(capture_i * dt, end_ts - FRAME_CAPTURE_BACKOFF))
-        segments.append({
+    # ── Groups: consecutive stages where content only grows = one slide ──
+    groups: list[list[tuple[int, int]]] = []
+    for stage in stages:
+        if groups and _is_build_continuation(thumbs[groups[-1][-1][1]], thumbs[stage[1]]):
+            groups[-1].append(stage)
+        else:
+            groups.append([stage])
+
+    states: list[dict] = []
+    for group in groups:
+        start_i, end_i = group[0][0], group[-1][1]
+        final_lo, final_hi = group[-1]
+        capture_i = _pick_capture_index(thumbs, final_lo, final_hi)
+        start_ts, end_ts = start_i * dt, (end_i + 1) * dt
+        capture_ts = max(start_ts, min(capture_i * dt, end_ts - 0.5))
+        states.append({
             "start": start_ts, "end": end_ts, "capture": capture_ts,
             "mid": (start_ts + end_ts) / 2, "thumb": thumbs[capture_i],
         })
 
-    anchor, seg_start = thumbs[0], 0
-    seg_last_quiet = 0
-    for i in range(1, len(thumbs)):
-        f = thumbs[i]
-        if _changed_ratio(f, thumbs[i - 1]) <= FRAME_SOFT_CHANGE_RATIO:
-            seg_last_quiet = i
-        if _changed_ratio(f, anchor) > FRAME_SPLIT_DRIFT_RATIO:
-            # Picture moved on (slide flip, cut, or next build stage) —
-            # close at the last quiet frame so mid-transition blur is skipped
-            close_segment(seg_start, i - 1, seg_last_quiet)
-            anchor, seg_start = f, i
-            seg_last_quiet = i
-    close_segment(seg_start, len(thumbs) - 1, seg_last_quiet)
-
-    states = [s for s in segments if s["end"] - s["start"] >= FRAME_MIN_STABLE_SECONDS]
-    if not states:  # short/dynamic video — keep the longest segments anyway
-        states = sorted(segments, key=lambda s: s["start"] - s["end"])[:3]
+    all_states = states
+    states = [s for s in states if s["end"] - s["start"] >= FRAME_MIN_STABLE_SECONDS]
+    if not states:  # short/dynamic video — keep the longest slides anyway
+        states = sorted(all_states, key=lambda s: s["start"] - s["end"])[:3]
         states.sort(key=lambda s: s["start"])
 
     # Global dedup: a segment visually identical to an earlier one is a
@@ -685,12 +755,10 @@ def _extract_keyframes(
 ) -> list[tuple[Path, float, dict, str]]:
     """Completed-slide keyframes: [(jpg_path, start_timestamp, state, ocr_text)].
 
-    Each segment's frame is captured at its END (`state["capture"]`) — the
-    moment the author has added the last element — not the middle, which for
-    progressively-built slides is half-constructed. Safety net: if the end
-    capture OCRs much poorer than the segment's mid frame (caught a fade-out),
-    fall back to the mid frame. The returned timestamp is the segment START so
-    the Notion timestamp link jumps to where the slide begins.
+    One frame per slide, taken at `state["capture"]` — the settled frame with
+    the most content in the slide's final build stage, i.e. after the author
+    added the last element. The returned timestamp is the slide's START so the
+    Notion timestamp link jumps to where the slide first appeared.
     """
     frames_dir.mkdir(parents=True, exist_ok=True)
     states = _find_stable_states(_sample_thumbs(video_path))
@@ -699,18 +767,7 @@ def _extract_keyframes(
         out = frames_dir / f"{i + 1:04d}.jpg"
         if not _extract_frame_at(video_path, state["capture"], out):
             continue
-        text = _ocr_image(out, ocr_langs)
-        # Fallback: end capture caught a transition → mid frame reads richer
-        if abs(state["capture"] - state["mid"]) > 1.5:
-            alt = frames_dir / f"{i + 1:04d}_mid.jpg"
-            if _extract_frame_at(video_path, state["mid"], alt):
-                alt_text = _ocr_image(alt, ocr_langs)
-                if len(text.strip()) < 0.6 * len(alt_text.strip()):
-                    alt.replace(out)
-                    text = alt_text
-                else:
-                    alt.unlink(missing_ok=True)
-        kept.append((out, state["start"], state, text))
+        kept.append((out, state["start"], state, _ocr_image(out, ocr_langs)))
     return kept
 
 
@@ -799,30 +856,36 @@ def _text_contains(small: str, big: str) -> bool:
 def _dedup_slides(slides: list[dict]) -> list[dict]:
     """Collapse build-up stages and re-detections of the same slide.
 
-    A slide whose OCR text is contained in the NEXT slide's text is an earlier
-    build stage of that slide (the author kept adding elements): keep the
-    later, completed image but the earlier start timestamp — that's when the
-    slide first appeared. Near-identical neighbours keep the first occurrence.
+    Safety net for build-ups the pixel-level grouping in `_find_stable_states`
+    did not catch. A slide whose OCR text is contained in the NEXT slide's is
+    an earlier build stage of it; near-identical neighbours are the same slide
+    re-detected. Either way the merge keeps the MORE COMPLETE image and the
+    EARLIER timestamp — never a half-built frame.
     """
     def norm(t: str) -> str:
         return re.sub(r"\s+", " ", t.strip().lower())
 
+    def absorb(previous: dict, current: dict, keep: dict) -> dict:
+        """Merge two detections of one slide, keeping `keep`'s image."""
+        merged = dict(keep)
+        merged["start"] = previous["start"]
+        if "state" in merged and "state" in previous:
+            merged["state"] = {**merged["state"], "start": previous["state"]["start"]}
+        return merged
+
     deduped: list[dict] = []
     for slide in slides:
         if deduped:
-            prev, cur = norm(deduped[-1]["ocr_text"]), norm(slide["ocr_text"])
+            previous = deduped[-1]
+            prev, cur = norm(previous["ocr_text"]), norm(slide["ocr_text"])
             if prev and cur and _text_contains(prev, cur):
-                # Build stage (or re-detection): absorb — completed image wins,
-                # slide keeps the timestamp of when it first appeared
-                merged = dict(slide)
-                merged["start"] = deduped[-1]["start"]
-                if "state" in merged and "state" in deduped[-1]:
-                    merged["state"] = {**merged["state"],
-                                       "start": deduped[-1]["state"]["start"]}
-                deduped[-1] = merged
+                deduped[-1] = absorb(previous, slide, slide)  # later = completed
                 continue
             if prev and cur and difflib.SequenceMatcher(None, prev, cur).ratio() > 0.85:
-                continue  # near-identical but shrinking (element removed) — keep first
+                # Same slide seen twice — keep whichever frame reads richer
+                richer = slide if len(cur) > len(prev) else previous
+                deduped[-1] = absorb(previous, slide, richer)
+                continue
         deduped.append(slide)
     if len(deduped) < len(slides):
         print(f"  Merged {len(slides) - len(deduped)} build-stage/duplicate slides (OCR)")
@@ -1470,65 +1533,6 @@ def link_summary_to_transcript(notion, page_id: str, page_url: str) -> None:
         print(f"  ⚠ Could not link summary to transcript ({e}) — ▶ video links still work")
 
 
-def bullet_block_with_timestamp_link(text: str, video_id: str) -> dict:
-    """Create a bullet block where [MM:SS] timestamps are clickable YouTube links."""
-    match = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]\s*(.*)", text)
-    if not match:
-        return bullet_block(text)
-
-    ts_str = match.group(1)
-    rest = match.group(2)
-    seconds = timestamp_to_seconds(ts_str)
-    yt_link = f"https://www.youtube.com/watch?v={video_id}&t={seconds}s"
-
-    rich_text = [
-        {
-            "type": "text",
-            "text": {"content": f"[{ts_str}]", "link": {"url": yt_link}},
-            "annotations": {"bold": True, "color": "blue"},
-        },
-        {
-            "type": "text",
-            "text": {"content": f" {rest}"},
-        },
-    ]
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": rich_text},
-    }
-
-
-def bullet_block_with_timestamp_plain(text: str) -> dict:
-    """Create a bullet block where [MM:SS] timestamps are bold plain text.
-
-    Used for non-YouTube platforms (e.g. Vimeo) where timestamp hyperlinks
-    are not standardized.
-    """
-    match = re.match(r"^\[(\d+:\d{2}(?::\d{2})?)\]\s*(.*)", text)
-    if not match:
-        return bullet_block(text)
-    ts_str = match.group(1)
-    rest = match.group(2)
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {"content": f"[{ts_str}]"},
-                    "annotations": {"bold": True},
-                },
-                {
-                    "type": "text",
-                    "text": {"content": f" {rest}"},
-                },
-            ]
-        },
-    }
-
-
 def divider_block() -> dict:
     return {"object": "block", "type": "divider", "divider": {}}
 
@@ -1609,13 +1613,14 @@ def create_notion_page(
     if not parent_id:
         sys.exit("Error: NOTION_DATABASE_ID not set in .env")
 
-    # Topic-tagged slides illustrate their summary bullet; the rest go to
-    # the 投影片重點 section. One shared embed budget across both.
+    # Only topic-tagged slides are shown, as an image under their summary
+    # bullet. The rest still shaped the summary via the SLIDES prompt section.
     slides = slides or []
     topic_slides = {s["topic_ts"]: s for s in slides if s.get("topic_ts") is not None}
     embeds_left = FRAME_MAX_EMBEDS
-    if slides:
-        print(f"  Uploading up to {min(len(slides), FRAME_MAX_EMBEDS)} slide images to Notion...")
+    if topic_slides:
+        print(f"  Uploading up to {min(len(topic_slides), FRAME_MAX_EMBEDS)} "
+              "topic images to Notion...")
 
     # Build summary bullet blocks (each followed by its topic frame, if any).
     # The [MM:SS] is linked to its transcript section after the page exists;
@@ -1632,7 +1637,6 @@ def create_notion_page(
             upload_id = _upload_file_to_notion(slide["image_path"])
             if upload_id:
                 summary_bullets.append(image_block_uploaded(upload_id))
-                slide["_embedded"] = True
                 embeds_left -= 1
 
     # Build transcript paragraph blocks (chunked)
@@ -1662,24 +1666,6 @@ def create_notion_page(
     # Summary section
     blocks.append(heading_block("Summary"))
     blocks.extend(summary_bullets)
-
-    # 投影片重點: informative slides not already shown under a summary topic
-    leftover = [s for s in slides if not s.get("_embedded") and s["note"].strip()]
-    if leftover:
-        blocks.append(divider_block())
-        blocks.append(heading_block("投影片重點"))
-        for slide in leftover:
-            ts = format_timestamp(slide["start"])
-            line = f"[{ts}] {slide['note']}"
-            if platform == "youtube":
-                blocks.append(bullet_block_with_timestamp_link(line, video_id))
-            else:
-                blocks.append(bullet_block_with_timestamp_plain(line))
-            if embeds_left > 0:
-                upload_id = _upload_file_to_notion(slide["image_path"])
-                if upload_id:
-                    blocks.append(image_block_uploaded(upload_id))
-                    embeds_left -= 1
 
     blocks.append(divider_block())
 
