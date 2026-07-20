@@ -5,7 +5,7 @@
 **When the user pastes a YouTube URL (youtube.com, youtu.be) and mentions Notion, saving, summarizing, or transcribing — IMMEDIATELY run the command below. Do NOT search the web, do NOT try to fetch the video yourself, do NOT use MCP tools. Just run this bash command:**
 
 ```bash
-cd /Users/Abalu/Claude-0316 && echo "YOUTUBE_URL_HERE" | python yt2notion.py
+cd /Users/luke-mini/Claude/Tools/yt2notion && echo "YOUTUBE_URL_HERE" | python3 yt2notion.py
 ```
 
 Replace `YOUTUBE_URL_HERE` with the actual URL from the user's message. Set a timeout of 600000ms (10 minutes) since long videos take time to process. Report the Notion page URL when done.
@@ -16,7 +16,12 @@ Replace `YOUTUBE_URL_HERE` with the actual URL from the user's message. Set a ti
 
 ## What This Is
 
-A single-file Python CLI tool (`yt2notion.py`) that takes a YouTube URL and creates a structured Notion page containing a summary with clickable timestamps and a formatted full transcript.
+Two complementary CLI tools:
+
+- **`yt2notion.py`** — takes a YouTube URL → Notion page with summary (clickable timestamps) + formatted transcript
+- **`audio2notion.py`** — takes a local audio file (m4a, mp3, wav, etc.) → Notion page with summary + formatted transcript
+
+The Telegram bot (`telegram_bot.py`) supports both: paste a YouTube URL **or** drop an m4a file into the channel.
 
 ## Required Configuration (`.env`)
 
@@ -63,18 +68,44 @@ The pipeline runs in 6 sequential steps:
 - Paragraph text chunked to max 1900 chars (Notion limit is 2000); splits at sentence then word boundaries
 - Summary timestamp links rendered as bold blue `rich_text` with `"link": {"url": "...&t=Xs"}`
 
-## Key Functions
+## audio2notion.py — Local Audio File Pipeline
+
+```
+python3 audio2notion.py /path/to/file.m4a
+python3 audio2notion.py /path/to/file.m4a --title "Meeting Title"
+echo "/path/to/file.m4a" | python3 audio2notion.py
+```
+
+Accepts: `.m4a`, `.mp3`, `.wav`, `.ogg`, `.flac`, `.mp4`
+
+Pipeline (4 steps):
+1. **Convert** — ffmpeg → 16kHz mono WAV
+2. **Transcribe** — whisper.cpp large-v3 (Metal GPU)
+3. **Summarize + Format** — Claude CLI (same prompts as yt2notion)
+4. **Notion page** — Summary bullets + Full Transcript (no YouTube bookmark/thumbnail)
+
+No `OPENAI_API_KEY` needed — uses Claude CLI session like yt2notion.
+
+## telegram_bot.py — Supported Inputs
+
+| Input | Handler |
+|---|---|
+| YouTube URL (text) | `handle_message` → runs `yt2notion.py` |
+| Audio file / voice note | `handle_audio` → downloads → runs `audio2notion.py` |
+| Document with audio extension | `handle_audio` → same |
+
+## Key Functions in yt2notion.py
 
 | Function | Location | Purpose |
 |---|---|---|
-| `get_youtube_transcript` | line 132 | Tier 1+2 transcript fetching |
-| `transcribe_with_whisper_local` | line 272 | Tier 3 whisper.cpp fallback |
-| `_parse_vtt` | line 208 | Parse WebVTT subtitle files |
-| `summarize` | line 343 | GPT-4o-mini summarization |
-| `format_conversation` | line 369 | GPT-4o-mini conversation formatting |
-| `create_notion_page` | line 516 | Build and upload all Notion blocks |
-| `bullet_block_with_timestamp_link` | line 467 | Render clickable timestamp links |
-| `chunk_text` | line 404 | Split text for Notion's block size limit |
+| `get_youtube_transcript` | line 144 | Tier 1+2 transcript fetching |
+| `transcribe_with_whisper_local` | line 361 | Tier 3 whisper.cpp fallback |
+| `_parse_vtt` | line 225 | Parse WebVTT subtitle files |
+| `summarize` | line 416 | Claude CLI summarization |
+| `format_conversation` | line 482 | Claude CLI conversation formatting |
+| `create_notion_page` | line 690 | Build and upload all Notion blocks |
+| `bullet_block_with_timestamp_link` | line 641 | Render clickable timestamp links |
+| `chunk_text` | line 578 | Split text for Notion's block size limit |
 
 ## Dependencies
 

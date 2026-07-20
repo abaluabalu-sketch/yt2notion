@@ -6,7 +6,7 @@ Usage: python audio2notion.py /path/to/audio.m4a
 
 Steps:
   1. Convert audio to 16kHz WAV (ffmpeg)
-  2. Transcribe with whisper.cpp large-v3-turbo (Metal GPU)
+  2. Transcribe with whisper.cpp large-v3 (Metal GPU)
   3. Clean up transcript via Claude (filler words, false starts, grammar)
   4. Create Notion page with clean transcription
 """
@@ -40,7 +40,7 @@ FFMPEG_PATH = get_ffmpeg_path()
 
 # ── whisper.cpp paths ─────────────────────────────────────────────────────────
 WHISPER_CPP_BIN   = Path.home() / ".local" / "whisper-cpp" / "whisper-cli"
-WHISPER_CPP_MODEL = Path.home() / ".local" / "whisper-cpp" / "models" / "ggml-large-v3-turbo.bin"
+WHISPER_CPP_MODEL = Path.home() / ".local" / "whisper-cpp" / "models" / "ggml-large-v3.bin"
 
 # ── Claude CLI ────────────────────────────────────────────────────────────────
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
@@ -91,8 +91,6 @@ def _strip_trailing_hallucinations(segments: list[dict]) -> list[dict]:
 
     if len(segments) >= 3:
         tail_text = norm(segments[-1]["text"])
-        repeat_count = sum(1 for seg in reversed(segments) if norm(seg["text"]) == tail_text)
-        # stop counting once a non-matching seg is found
         actual_repeat = 0
         for seg in reversed(segments):
             if norm(seg["text"]) == tail_text:
@@ -156,7 +154,7 @@ def transcribe_audio(audio_path: Path) -> list[dict]:
             capture_output=True, check=True
         )
 
-        print("  Transcribing with large-v3-turbo (Metal GPU)...")
+        print("  Transcribing with large-v3 (Metal GPU)...")
         r = subprocess.run(
             [str(WHISPER_CPP_BIN),
              "-m", str(WHISPER_CPP_MODEL),
@@ -183,7 +181,7 @@ def segments_to_raw_text(segments: list[dict]) -> str:
     return " ".join(seg["text"] for seg in segments)
 
 
-# ── Title generation ─────────────────────────────────────────────────────────
+# ── Title generation ──────────────────────────────────────────────────────────
 
 def generate_title(transcript: str) -> str:
     """Generate a concise Notion page title from the full cleaned transcript."""
@@ -257,7 +255,7 @@ def clean_transcript(segments: list[dict]) -> str:
 
     print(f"  {len(chunks)} chunk(s) to clean...")
     results = [_clean_chunk(chunk) for chunk in chunks]
-    print(f"  Done")
+    print("  Done")
     return "\n\n".join(results)
 
 
@@ -304,7 +302,7 @@ def create_notion_page(title: str, transcript: str) -> str:
     page = notion.pages.create(
         parent={"type": "database_id", "database_id": parent_id},
         properties={
-            "Name": {"title": [{"type": "text", "text": {"content": title}}]},
+            "title": {"title": [{"type": "text", "text": {"content": title}}]},
         },
         children=blocks[:100],
     )
@@ -355,7 +353,13 @@ def main():
     print(f"  Done in {time.time() - t0:.1f}s")
 
     print(f"\nTotal: {time.time() - total_start:.1f}s")
+    print(f"Title: {title}")
     print(f"\nNotion page: {page_url}")
+
+    # Delimited transcript for downstream consumers (e.g. Telegram bot)
+    print("\n===TRANSCRIPT_START===")
+    print(transcript)
+    print("===TRANSCRIPT_END===")
 
 
 if __name__ == "__main__":

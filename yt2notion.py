@@ -46,6 +46,11 @@ _node_dir = Path.home() / ".local" / "node" / "bin"
 if _node_dir.exists() and str(_node_dir) not in os.environ.get("PATH", ""):
     os.environ["PATH"] = f"{_node_dir}:{os.environ.get('PATH', '')}"
 
+# ── Ensure user Python bin is on PATH (for yt-dlp) ────────────────────────
+_py_bin = Path.home() / "Library" / "Python" / "3.9" / "bin"
+if _py_bin.exists() and str(_py_bin) not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = f"{_py_bin}:{os.environ.get('PATH', '')}"
+
 # ── ffmpeg path (via imageio-ffmpeg for portability) ──────────────────────
 def get_ffmpeg_path() -> str:
     try:
@@ -61,7 +66,7 @@ FFMPEG_PATH = get_ffmpeg_path()
 
 def _yt_dlp_extra_args() -> list[str]:
     """Return extra yt-dlp args: browser cookies + remote EJS solver."""
-    args = ["--remote-components", "ejs:github"]
+    args = []
     # Read cookies live from Chrome — no manual export needed
     args += ["--cookies-from-browser", "chrome"]
     return args
@@ -71,37 +76,22 @@ def _yt_dlp_extra_args() -> list[str]:
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
 
 def call_claude(prompt: str, max_tokens: int = 8192) -> str:
-    """Call the claude CLI with a prompt, return the response text.
-
-    Falls back to OpenAI API (gpt-4o-mini) if the Claude CLI is unavailable
-    (e.g. when running inside a Claude Code session — 'Auto mode temporarily unavailable').
-    """
-    # Try Claude CLI first
-    result = subprocess.run(
-        [str(CLAUDE_BIN), "--print", "--output-format", "text"],
-        input=prompt,
-        capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        output = result.stdout.strip()
-        if output and "auto mode temporarily unavailable" not in output.lower():
-            return output
-
-    # Fall back to OpenAI API
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        sys.exit("Error: Claude CLI unavailable and OPENAI_API_KEY not set in .env")
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=openai_key)
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
+    """Call the claude CLI with a prompt, return the response text. Retries once on failure."""
+    for attempt in range(2):
+        result = subprocess.run(
+            [str(CLAUDE_BIN), "--print", "--output-format", "text"],
+            input=prompt,
+            capture_output=True, text=True
         )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        sys.exit(f"Error calling OpenAI API fallback: {e}")
+        if result.returncode == 0:
+            return result.stdout.strip()
+        if attempt == 0:
+            time.sleep(3)  # brief pause before retry
+    sys.exit(
+        f"Error calling claude CLI (RC={result.returncode}):\n"
+        f"stdout: {result.stdout[:300]}\n"
+        f"stderr: {result.stderr[:300]}"
+    )
 
 
 def get_notion():
@@ -180,7 +170,7 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def get_youtube_transcript(video_id: str, url: str) -> list[dict] | None:
+def get_youtube_transcript(video_id: str, url: str) -> "list[dict] | None":
     """Try to fetch manually uploaded YouTube subtitles only.
 
     Auto-generated subtitles are NEVER used — Whisper produces better quality.
@@ -341,14 +331,37 @@ def _parse_vtt(vtt_path: str) -> list[dict]:
 
 
 def _download_audio(url: str, tmpdir: str) -> Path:
-    """Download audio from YouTube URL into tmpdir, return file path."""
+    """Download audio from YouTube URL into tmpdir, return file path.
+
+    Tries pytubefix first (handles YouTube SABR streaming), then falls back
+    to yt-dlp.
+    """
     audio_path = Path(tmpdir) / "audio.m4a"
+
+    # ── Method 1: pytubefix (handles SABR/modern YouTube) ────────────────
+    try:
+        from pytubefix import YouTube as PyTube
+        yt = PyTube(url)
+        stream = (
+            yt.streams.filter(only_audio=True, mime_type="audio/mp4")
+            .order_by("abr").desc().first()
+            or yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+        )
+        if stream:
+            stream.download(output_path=tmpdir, filename="audio.m4a")
+            return audio_path
+    except Exception as e:
+        print(f"  pytubefix download failed ({type(e).__name__}: {e}), trying yt-dlp...")
+
+    # ── Method 2: yt-dlp fallback ─────────────────────────────────────────
     try:
         subprocess.run(
             [
                 "yt-dlp",
                 "--no-playlist",
-                "-f", "bestaudio[ext=m4a]/bestaudio",
+                "-f", "bestaudio[ext=m4a]/bestaudio/best",
+                "--extract-audio",
+                "--audio-format", "m4a",
                 "--ffmpeg-location", FFMPEG_PATH,
                 *_yt_dlp_extra_args(),
                 "-o", str(audio_path),
@@ -363,7 +376,7 @@ def _download_audio(url: str, tmpdir: str) -> Path:
 
 # ── whisper.cpp paths ─────────────────────────────────────────────────────
 WHISPER_CPP_BIN   = Path.home() / ".local" / "whisper-cpp" / "whisper-cli"
-WHISPER_CPP_MODEL = Path.home() / ".local" / "whisper-cpp" / "models" / "ggml-large-v3-turbo.bin"
+WHISPER_CPP_MODEL = Path.home() / ".local" / "whisper-cpp" / "models" / "ggml-large-v3.bin"
 
 def _parse_whisper_json(json_path: Path) -> list[dict]:
     """Parse whisper.cpp JSON output into {text, start} segments.
@@ -460,7 +473,7 @@ def transcribe_with_whisper_local(url: str) -> list[dict]:
         )
 
         # ── Transcription: whisper.cpp large-v3 ─────────────────────────────
-        print("  Transcribing with large-v3-turbo (Metal GPU)...")
+        print("  Transcribing with large-v3 (Metal GPU)...")
         r1 = subprocess.run(
             [str(WHISPER_CPP_BIN),
              "-m", str(WHISPER_CPP_MODEL),
@@ -951,12 +964,18 @@ def main():
     total = time.time() - total_start
     print("\n" + "=" * 40)
     print("Done!")
+    print(f"Title: {meta['title']}")
     print(f"Notion page: {page_url}")
     print(f"\n⏱  Timing breakdown:")
     for step, secs in timings.items():
         print(f"  {step}: {secs:.1f}s")
     print(f"  {'─' * 30}")
     print(f"  TOTAL: {total:.1f}s ({total/60:.1f} min)")
+
+    # Delimited transcript for downstream consumers (e.g. Telegram bot)
+    print("\n===TRANSCRIPT_START===")
+    print(conversation_text)
+    print("===TRANSCRIPT_END===")
 
 
 if __name__ == "__main__":
